@@ -1,0 +1,13 @@
+
+/frontend/node_modules
+/UI- Figma
+/backend/node_modules
+.env
+*.env
+.env.*
+*.pem
+certs/
+node_modules
+dist
+__pycache__/
+*.pyc
