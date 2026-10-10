@@ -3,25 +3,8 @@ import { useState } from "react"
 import { useNavigate } from "react-router"
 import Badge from "./Badge"
 
-type Product = {
-  id: string
-  brand: string
-  name: string
-  image: string
-  rating: number
-  reviews: number
-  specs: string[]
-  bestPrice: number
-  mrp: number
-  discount: number
-  bestStore: string
-  stores: number
-  trend: string
-  aiVerdict: string
-  verdictColor: string
-  category: string
-  priceHistory: number[]
-}
+import type { Product } from "../../types/product"
+export type { Product }
 
 const fmt = (n: number) => "₹" + n.toLocaleString("en-IN")
 
@@ -63,8 +46,41 @@ export default function ProductCard({ product, onCompare, selected }: {
       </button>
 
       <div className="p-4">
-        <div className="aspect-square w-full overflow-hidden rounded-lg bg-slate-50 mb-3">
-          <img src={product.image} alt={product.name} className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300" />
+        <div className="aspect-square w-full overflow-hidden rounded-lg bg-slate-50 mb-3 flex items-center justify-center p-2">
+          <img
+            src={(() => {
+              if (product.image) {
+                const spMatch = product.image.match(/(?:images\.smartprix\.com\/|rx-i)([A-Za-z0-9_-]+)(?:\.webp|-w)/);
+                if (spMatch) {
+                  return `https://cdn1.smartprix.com/rx-i${spMatch[1]}-w280-h280/phone.webp`;
+                }
+                return product.image;
+              }
+              const b = (product.brand || '').toLowerCase();
+              if (b.includes('apple')) return 'https://images.unsplash.com/photo-1695048133142-1a20484d2569?w=600&auto=format&fit=crop&q=80';
+              if (b.includes('samsung')) return 'https://images.unsplash.com/photo-1610945265064-0e34e5519bbf?w=600&auto=format&fit=crop&q=80';
+              if (b.includes('oneplus')) return 'https://images.unsplash.com/photo-1598327105666-5b89351aff97?w=600&auto=format&fit=crop&q=80';
+              if (b.includes('motorola')) return 'https://images.unsplash.com/photo-1511707171634-5f897ff02aa9?w=600&auto=format&fit=crop&q=80';
+              if (b.includes('vivo')) return 'https://images.unsplash.com/photo-1580910051074-3eb694886505?w=600&auto=format&fit=crop&q=80';
+              if (b.includes('realme')) return 'https://images.unsplash.com/photo-1565849904461-04a58ad377e0?w=600&auto=format&fit=crop&q=80';
+              if (b.includes('oppo')) return 'https://images.unsplash.com/photo-1574944985070-8f3ebc6b79d2?w=600&auto=format&fit=crop&q=80';
+              return 'https://images.unsplash.com/photo-1511707171634-5f897ff02aa9?w=600&auto=format&fit=crop&q=80';
+            })()}
+            alt={product.name}
+            referrerPolicy="no-referrer"
+            onError={(e) => {
+              const b = (product.brand || '').toLowerCase();
+              if (b.includes('apple')) e.currentTarget.src = 'https://images.unsplash.com/photo-1695048133142-1a20484d2569?w=600&auto=format&fit=crop&q=80';
+              else if (b.includes('samsung')) e.currentTarget.src = 'https://images.unsplash.com/photo-1610945265064-0e34e5519bbf?w=600&auto=format&fit=crop&q=80';
+              else if (b.includes('oneplus')) e.currentTarget.src = 'https://images.unsplash.com/photo-1598327105666-5b89351aff97?w=600&auto=format&fit=crop&q=80';
+              else if (b.includes('motorola')) e.currentTarget.src = 'https://images.unsplash.com/photo-1511707171634-5f897ff02aa9?w=600&auto=format&fit=crop&q=80';
+              else if (b.includes('vivo')) e.currentTarget.src = 'https://images.unsplash.com/photo-1580910051074-3eb694886505?w=600&auto=format&fit=crop&q=80';
+              else if (b.includes('realme')) e.currentTarget.src = 'https://images.unsplash.com/photo-1565849904461-04a58ad377e0?w=600&auto=format&fit=crop&q=80';
+              else if (b.includes('oppo')) e.currentTarget.src = 'https://images.unsplash.com/photo-1574944985070-8f3ebc6b79d2?w=600&auto=format&fit=crop&q=80';
+              else e.currentTarget.src = 'https://images.unsplash.com/photo-1511707171634-5f897ff02aa9?w=600&auto=format&fit=crop&q=80';
+            }}
+            className="w-full h-full object-contain group-hover:scale-105 transition-transform duration-300"
+          />
         </div>
 
         <p className="text-xs font-semibold text-indigo-600 uppercase tracking-wide mb-1">{product.brand}</p>
@@ -90,11 +106,30 @@ export default function ProductCard({ product, onCompare, selected }: {
             <span className="text-xl font-bold text-slate-900">{fmt(product.bestPrice)}</span>
             <span className="text-sm text-slate-400 line-through">{fmt(product.mrp)}</span>
           </div>
-          <div className="flex items-center gap-1.5 mt-0.5">
-            <span className="text-xs text-slate-500">Best at</span>
-            <span className="text-xs font-semibold text-slate-700">{product.bestStore}</span>
-            <span className="text-xs text-slate-400">+{product.stores - 1} stores</span>
-          </div>
+          {product.storePrices && product.storePrices.length > 0 ? (
+            <div className="flex flex-wrap gap-1 mt-1.5">
+              {product.storePrices.map((st) => (
+                <span
+                  key={st.store}
+                  className={`text-[11px] px-1.5 py-0.5 rounded font-medium border flex items-center gap-1 ${
+                    st.diff === 0
+                      ? "bg-emerald-50 text-emerald-800 border-emerald-200 font-semibold"
+                      : "bg-slate-50 text-slate-600 border-slate-200"
+                  }`}
+                >
+                  <span>{st.store}:</span>
+                  <span className="font-mono">{fmt(st.price)}</span>
+                </span>
+              ))}
+            </div>
+          ) : (
+            <div className="flex items-center gap-1 mt-1.5">
+              <span className="text-[11px] px-1.5 py-0.5 rounded font-semibold border bg-emerald-50 text-emerald-800 border-emerald-200 flex items-center gap-1">
+                <span>{product.bestStore || "Amazon"}:</span>
+                <span className="font-mono">{fmt(product.bestPrice)}</span>
+              </span>
+            </div>
+          )}
         </div>
 
         <Badge variant={verdiantMap[product.verdictColor] || "neutral"} className="mb-3 text-xs">
