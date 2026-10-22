@@ -1,8 +1,11 @@
 import prisma from '../utils/prisma';
 import { HttpError } from '../utils/http';
-import { TtlCache } from '../utils/cache';
+import { TtlCache, livePriceCache } from '../utils/cache';
+import { parsePrice, evaluateStockStatus } from '../utils/priceNormalizer';
 import { evaluatePriceChange } from './alertEngine';
 import { MATCH_THRESHOLD, titleSimilarity } from './matching';
+import { isExactProductMatch } from '../utils/productMatcher';
+import { sanitizeRetailerUrl } from '../utils/urlSanitizer';
 import { refreshProductAggregates } from './productService';
 import { ProviderId, StoreOffer, StoreProvider, configuredProviders, providers } from './stores';
 import { clearMarketIntelligenceCache } from './marketIntelligenceService';
@@ -43,12 +46,15 @@ const applyAggregatesAndAlerts = async (productIds: Iterable<string>): Promise<n
     if (bestPrice !== null) notifications += await evaluatePriceChange(productId, previousBest, bestPrice);
   }
   clearMarketIntelligenceCache();
+  await livePriceCache.invalidatePattern('serp_live::*');
   return notifications;
 };
 
 const recordOffer = async (listingId: string, offer: StoreOffer, current: { mrp: number | null; shippingCost: number }) => {
   const now = new Date();
-  if (offer.price === null) {
+  const cleanPrice = parsePrice(offer.price);
+  const stock = evaluateStockStatus(offer.inStock);
+  if (cleanPrice <= 0 || !stock.inStock) {
     await prisma.productStore.update({
       where: { id: listingId },
       data: { stockStatus: 'OUT_OF_STOCK', lastCheckedAt: now },
@@ -58,17 +64,57 @@ const recordOffer = async (listingId: string, offer: StoreOffer, current: { mrp:
   await prisma.productStore.update({
     where: { id: listingId },
     data: {
-      currentPrice: offer.price,
-      mrp: offer.mrp ?? current.mrp,
+      currentPrice: cleanPrice,
+      mrp: offer.mrp ? parsePrice(offer.mrp) : current.mrp,
       currency: offer.currency,
-      stockStatus: offer.inStock ? 'IN_STOCK' : 'OUT_OF_STOCK',
+      stockStatus: stock.stockStatus,
       shippingCost: offer.shippingCost ?? current.shippingCost,
-      productUrl: offer.productUrl,
+      productUrl: sanitizeRetailerUrl(offer.productUrl, offer.provider),
       lastCheckedAt: now,
-      priceHistory: { create: { price: offer.price, currency: offer.currency, timestamp: now } },
+      priceHistory: { create: { price: cleanPrice, currency: offer.currency, timestamp: now } },
     },
   });
 };
+
+/**
+ * Execute an async operation with exponential backoff on transient errors (429, 503, timeouts)
+ */
+async function executeWithRetry<T>(
+  fn: () => Promise<T>,
+  retries = 3,
+  initialDelayMs = 1000,
+  context = 'priceSync',
+): Promise<T> {
+  let attempt = 0;
+  while (attempt < retries) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      attempt++;
+      const isTransient =
+        err?.status === 429 ||
+        err?.statusCode === 429 ||
+        err?.status === 503 ||
+        err?.statusCode === 503 ||
+        err?.code === 'ETIMEDOUT' ||
+        err?.code === 'ECONNRESET' ||
+        err?.name === 'AbortError' ||
+        (typeof err?.message === 'string' &&
+          (err.message.includes('429') ||
+            err.message.includes('503') ||
+            err.message.includes('rate limit') ||
+            err.message.includes('timeout')));
+
+      if (attempt >= retries || !isTransient) {
+        throw err;
+      }
+      const backoff = initialDelayMs * Math.pow(2, attempt - 1);
+      console.warn(`[${context}] Transient error (attempt ${attempt}/${retries}): ${err?.message || err}. Retrying in ${backoff}ms...`);
+      await new Promise((resolve) => setTimeout(resolve, backoff));
+    }
+  }
+  return fn();
+}
 
 /**
  * Refreshes prices for every listing that is linked to a store identifier (ASIN / FSN)
@@ -95,12 +141,27 @@ const runSync = async (opts: { productId?: string }): Promise<SyncSummary> => {
     if (listings.length === 0) continue;
 
     try {
-      const offers = await provider.getOffers(listings.map((l) => l.externalId!));
+      const offers = await executeWithRetry(
+        () => provider.getOffers(listings.map((l) => l.externalId!)),
+        3,
+        1000,
+        `ProviderSync:${provider.id}`,
+      );
       const byId = new Map(offers.map((o) => [o.externalId, o]));
       for (const listing of listings) {
         const offer = byId.get(listing.externalId!);
         if (!offer) {
           result.notFound++;
+          // Stale listing ghost-price protection: If an offer is no longer found and the listing
+          // was last checked more than 48 hours ago, mark OUT_OF_STOCK rather than retaining old ghost prices indefinitely
+          const daysSinceLastCheck = (Date.now() - new Date(listing.lastCheckedAt).getTime()) / (1000 * 60 * 60 * 24);
+          if (daysSinceLastCheck > 2 && listing.stockStatus !== 'OUT_OF_STOCK') {
+            await prisma.productStore.update({
+              where: { id: listing.id },
+              data: { stockStatus: 'OUT_OF_STOCK', lastCheckedAt: new Date() },
+            });
+            affected.add(listing.productId);
+          }
           continue;
         }
         await recordOffer(listing.id, offer, listing);
@@ -153,7 +214,7 @@ export interface LiveSearchResult {
   error?: string;
 }
 
-const liveCache = new TtlCache<StoreOffer[]>(10 * 60 * 1000);
+const liveCache = new TtlCache<StoreOffer[]>(30 * 1000); // 30s debounce for real-time live price comparison
 
 /** Queries the store APIs directly without persisting anything (results cached for 10 minutes). */
 export const searchStores = async (query: string, limit: number, providerIds?: string[]): Promise<LiveSearchResult[]> => {
@@ -184,6 +245,9 @@ const findMatchingProduct = async (offer: StoreOffer) => {
   });
   let best: { id: string; score: number } | null = null;
   for (const c of candidates) {
+    if (!isExactProductMatch(c.name, offer.title, 0.45) && titleSimilarity(offer.title, c.name, offer.brand) < 0.8) {
+      continue;
+    }
     const score = titleSimilarity(offer.title, c.name, offer.brand);
     if (score >= MATCH_THRESHOLD && (!best || score > best.score)) best = { id: c.id, score };
   }
@@ -258,9 +322,9 @@ export const importFromStores = async (
           productId,
           storeId: store.id,
           externalId: offer.externalId,
-          productUrl: offer.productUrl,
-          currentPrice: offer.price,
-          mrp: offer.mrp,
+          productUrl: sanitizeRetailerUrl(offer.productUrl, offer.provider),
+          currentPrice: parsePrice(offer.price),
+          mrp: offer.mrp ? parsePrice(offer.mrp) : null,
         },
       });
       await recordOffer(listing.id, offer, listing);
