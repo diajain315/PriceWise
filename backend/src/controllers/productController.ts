@@ -7,8 +7,13 @@ import { buildInsights, computeStats, computeVerdict, parseRange, sliceByDays } 
 import { presentCards, productInclude, resolveProductImageUrl, storePriceRows, toProductCard, StorePriceRow } from '../services/productService';
 import { findProductOr404, getPriceHistory, getPricePrediction, seriesFor } from '../services/historyService';
 import { env } from '../config/env';
-import { resolveDirectStoreUrl } from '../services/storeRedirectService';
+import { resolveDirectStoreUrl, validateCanonicalProductUrl } from '../services/storeRedirectService';
+import { refreshProductAggregates } from '../services/productService';
+import { parsePrice } from '../utils/priceNormalizer';
+import { livePriceCache } from '../utils/cache';
+import { TargetSpecs } from '../services/retailerScraperService';
 import { getLiveSerpStorePrices, matchAllowedStore } from '../services/serpShoppingService';
+import { scrapeLiveStoreListing, scrapeFlipkart, scrapeCroma } from '../services/retailerScraperService';
 
 const SORTS: Record<string, Prisma.ProductOrderByWithRelationInput[]> = {
   relevance: [{ reviewCount: 'desc' }, { rating: 'desc' }],
@@ -100,14 +105,19 @@ export const getCatalogMeta = async (_req: Request, res: Response): Promise<void
   });
 };
 
-// Lightweight TTL cache for product details (120s TTL)
+// Lightweight TTL cache for product details (15s TTL for fresh stock & prices)
 const productDetailCache = new Map<string, { data: any; expiry: number }>();
 
 export const getProduct = async (req: Request, res: Response): Promise<void> => {
   const productId = String(req.params.id);
   const now = Date.now();
+  const forceRefresh = req.query.refresh === 'true' || req.query.forceRefresh === 'true';
 
-  const cached = productDetailCache.get(productId);
+  if (forceRefresh) {
+    productDetailCache.delete(productId);
+  }
+
+  const cached = forceRefresh ? null : productDetailCache.get(productId);
   let baseData = cached && cached.expiry > now ? cached.data : null;
 
   if (!baseData) {
@@ -149,7 +159,7 @@ export const getProduct = async (req: Request, res: Response): Promise<void> => 
       pricesUpdatedAt: lastChecked?.toISOString() ?? null,
     };
 
-    productDetailCache.set(productId, { data: baseData, expiry: now + 120_000 });
+    productDetailCache.set(productId, { data: baseData, expiry: now + 15_000 });
   }
 
   let userState = null;
@@ -172,31 +182,152 @@ export const getProduct = async (req: Request, res: Response): Promise<void> => 
   });
 };
 
+export function extractProductSpecs(product: {
+  name: string;
+  specs?: string[];
+  techSpecs?: any;
+}): { ram?: string | null; storage?: string | null } {
+  const specsList = Array.isArray(product.specs) ? product.specs : [];
+  const specsStr = specsList.join(' ');
+  const tech = product.techSpecs && typeof product.techSpecs === 'object' ? (product.techSpecs as Record<string, unknown>) : {};
+  const nameStr = product.name || '';
+  const combined = `${nameStr} ${specsStr}`;
+
+  // 1. RAM extraction
+  let ram: string | null = null;
+  if (tech['RAM']) {
+    ram = String(tech['RAM']);
+  } else if (tech['Memory & Storage']) {
+    const ms = String(tech['Memory & Storage']);
+    const rMatch = ms.match(/([0-9]+)\s*GB\s*RAM/i) || ms.match(/([0-9]+)\s*GB/i);
+    if (rMatch) ram = `${rMatch[1]} GB`;
+  } else {
+    const ramMatch = combined.match(/([0-9]+)\s*GB\s*RAM/i);
+    if (ramMatch) ram = `${ramMatch[1]} GB`;
+  }
+
+  // 2. Storage extraction (internal storage only)
+  let storage: string | null = null;
+  if (tech['Internal Storage'] || tech['Storage'] || tech['ROM']) {
+    storage = String(tech['Internal Storage'] || tech['Storage'] || tech['ROM']);
+  } else if (tech['Memory & Storage']) {
+    const ms = String(tech['Memory & Storage']);
+    const sMatch =
+      ms.match(/([0-9]+)\s*(?:GB|TB)\s*(?:inbuilt|internal|ROM|storage)/i) ||
+      ms.match(/,\s*([0-9]+)\s*(?:GB|TB)/i) ||
+      ms.match(/([0-9]+)\s*(?:GB|TB)/i);
+    if (sMatch) storage = sMatch[0].replace(/^,\s*/, '').trim();
+  }
+
+  // Fallback to searching specs, ignoring expandable memory card / upto phrases
+  if (!storage) {
+    const cleanCombined = combined
+      .replace(/memory\s*card[^,]*/gi, '')
+      .replace(/upto\s*[0-9]+\s*(?:tb|gb)/gi, '')
+      .replace(/expandable[^,]*/gi, '');
+
+    const explicitInbuilt = cleanCombined.match(/([0-9]+)\s*(?:GB|TB)\s*(?:inbuilt|internal|ROM|storage)/i);
+    if (explicitInbuilt) {
+      storage = explicitInbuilt[0].trim();
+    } else {
+      const tbMatch = cleanCombined.match(/([0-9]+)\s*TB/i);
+      if (tbMatch) {
+        storage = `${tbMatch[1]} TB`;
+      } else {
+        const storageMatch =
+          nameStr.match(/([0-9]+)\s*GB/i) ||
+          cleanCombined.match(/([0-9]+)\s*GB/i);
+        if (storageMatch) storage = `${storageMatch[1]} GB`;
+      }
+    }
+  }
+
+  return { ram, storage };
+}
+
+async function persistLiveRatesToPostgres(productId: string, stores: StorePriceRow[]): Promise<void> {
+  try {
+    const dbStores = await prisma.store.findMany();
+    const storeMap = new Map<string, string>();
+    for (const s of dbStores) {
+      storeMap.set(s.slug.toLowerCase(), s.id);
+      storeMap.set(s.name.toLowerCase(), s.id);
+    }
+
+    const now = new Date();
+    for (const item of stores) {
+      if (!item.price || item.price <= 0) continue;
+      const slug = (item.storeSlug || item.store || '').toLowerCase();
+      let storeDbId = storeMap.get(slug);
+      if (!storeDbId) {
+        const matched = dbStores.find(
+          (s) => slug.includes(s.slug.toLowerCase()) || s.slug.toLowerCase().includes(slug),
+        );
+        if (matched) storeDbId = matched.id;
+      }
+      if (!storeDbId) continue;
+
+      const existing = await prisma.productStore.findUnique({
+        where: { productId_storeId: { productId, storeId: storeDbId } },
+      });
+
+      if (existing) {
+        const priceChanged = Math.abs(existing.currentPrice - item.price) > 1;
+        await prisma.productStore.update({
+          where: { id: existing.id },
+          data: {
+            currentPrice: item.price,
+            ...(item.mrp ? { mrp: item.mrp } : {}),
+            stockStatus: item.stockStatus,
+            lastCheckedAt: now,
+          },
+        });
+
+        if (priceChanged) {
+          await prisma.priceHistory.create({
+            data: {
+              productStoreId: existing.id,
+              price: item.price,
+              timestamp: now,
+            },
+          });
+        }
+      }
+    }
+
+    await refreshProductAggregates(productId);
+    productDetailCache.delete(productId);
+  } catch (err: any) {
+    console.warn(`[LiveStore] Failed to persist live rates for product ${productId}:`, err?.message || err);
+  }
+}
+
 export const getProductLiveStores = async (req: Request, res: Response): Promise<void> => {
   const productId = String(req.params.id);
+  const forceRefresh = req.query.refresh === 'true' || req.query.forceRefresh === 'true';
   const product = await findProductOr404(productId);
+  const targetSpecs = extractProductSpecs(product);
 
-  // 1. Primary ground truth: verified database listings
+  // 1. Live real-time prices from SerpApi (always fresh when user visits phone page)
+  const livePrices = await getLiveSerpStorePrices(product.name, product.brand, product.bestPrice, forceRefresh);
+
+  // Verified database store rows (used for missing retailer fallback or metadata)
   const dbStores = storePriceRows(product).filter((s) => {
     const match = matchAllowedStore(s.store, product.brand, product.name);
     return match !== null;
   });
 
-  // 2. Auxiliary live prices from SerpApi (with strict title and price tolerance checks)
-  const livePrices = await getLiveSerpStorePrices(product.name, product.brand, product.bestPrice);
+  if (livePrices.length > 0) {
+    // 2. SerpApi live results are the PRIMARY ground truth for real-time prices & stock
+    const liveStoreRows: StorePriceRow[] = livePrices.map((s) => {
+      const stockStatus =
+        s.stockStatus === 'OUT_OF_STOCK'
+          ? StockStatus.OUT_OF_STOCK
+          : s.stockStatus === 'LIMITED'
+          ? StockStatus.LIMITED
+          : StockStatus.IN_STOCK;
 
-  // 3. Merge: Database verified store listings always take precedence for known stores
-  const storeMap = new Map<string, StorePriceRow>();
-
-  for (const s of dbStores) {
-    storeMap.set(s.store.toLowerCase(), s);
-  }
-
-  // Augment with non-duplicate live store offers that passed verification
-  for (const s of livePrices) {
-    const key = s.store.toLowerCase();
-    if (!storeMap.has(key)) {
-      const row: StorePriceRow = {
+      return {
         storeId: s.storeId,
         store: s.store,
         storeSlug: s.storeSlug,
@@ -206,30 +337,130 @@ export const getProductLiveStores = async (req: Request, res: Response): Promise
         shipping: s.shipping || 'Free',
         shippingCost: 0,
         availability: s.availability || 'In Stock',
-        stockStatus: StockStatus.IN_STOCK,
+        stockStatus,
         diff: s.diff,
         url: s.url,
         lastCheckedAt: s.lastCheckedAt ?? new Date().toISOString(),
       };
-      storeMap.set(key, row);
+    });
+
+    // 3. For stores from DB not present in live SerpApi results, safely retain their verified database status
+    const liveSlugs = new Set(livePrices.map((p) => p.storeSlug.toLowerCase()));
+    const missingDbStores: StorePriceRow[] = dbStores
+      .filter((s) => !liveSlugs.has(s.storeSlug.toLowerCase()) && !liveSlugs.has(s.store.toLowerCase()))
+      .map((s) => ({
+        ...s,
+        availability: s.availability || (s.stockStatus === StockStatus.OUT_OF_STOCK ? 'Out of Stock' : 'In Stock'),
+        stockStatus: s.stockStatus || StockStatus.IN_STOCK,
+        diff: 0,
+      }));
+
+    const stores = [...liveStoreRows, ...missingDbStores];
+
+    // In Stock stores first (sorted by price ascending), then Limited, then Out of Stock
+    stores.sort((a, b) => {
+      const rank = (status: StockStatus) => {
+        if (status === StockStatus.IN_STOCK) return 0;
+        if (status === StockStatus.LIMITED) return 1;
+        return 2;
+      };
+      const rankDiff = rank(a.stockStatus) - rank(b.stockStatus);
+      if (rankDiff !== 0) return rankDiff;
+      return a.price - b.price;
+    });
+
+    const lowestInStock = stores.find((s) => s.stockStatus !== StockStatus.OUT_OF_STOCK)?.price ?? stores[0].price;
+    const finalStores = stores.map((s) => ({
+      ...s,
+      diff: s.stockStatus === StockStatus.OUT_OF_STOCK ? 0 : Math.max(0, s.price - lowestInStock),
+    }));
+
+    const bestInStock = finalStores.find((s) => s.stockStatus !== StockStatus.OUT_OF_STOCK) || finalStores[0];
+
+    if (forceRefresh) {
+      await persistLiveRatesToPostgres(productId, finalStores);
+    }
+
+    res.json({
+      stores: finalStores,
+      bestDealUrl: bestInStock?.url || null,
+      source: 'live_serpapi',
+      refreshedAt: new Date().toISOString(),
+    });
+    return;
+  }
+
+  // 4. Real-Time Live Direct Retailer Scraping:
+  // When SerpApi is exhausted (HTTP 429 quota reached) or returns no live results,
+  // scrape the verified store URLs (Croma, Amazon, Flipkart) directly in real-time!
+  const scrapedStores: StorePriceRow[] = await Promise.all(
+    dbStores.map(async (s) => {
+      const scraped = await scrapeLiveStoreListing(s.url, s.store, product.name, product.bestPrice, targetSpecs);
+      if (!scraped) return s;
+
+      return {
+        ...s,
+        price: scraped.price && scraped.price > 0 ? scraped.price : s.price,
+        stockStatus: scraped.stockStatus ?? s.stockStatus,
+        availability: scraped.availability ?? s.availability,
+        url: scraped.directUrl ?? s.url,
+        lastCheckedAt: new Date().toISOString(),
+      };
+    }),
+  );
+
+  // If Flipkart is not yet linked in database or live results, dynamically scrape Flipkart live in real-time!
+  const hasFlipkart = scrapedStores.some(
+    (s) => s.storeSlug?.toLowerCase() === 'flipkart' || s.store.toLowerCase().includes('flipkart'),
+  );
+  if (!hasFlipkart) {
+    try {
+      const fkOffer = await scrapeFlipkart('https://www.flipkart.com/search', product.bestPrice, product.name, targetSpecs);
+      if (fkOffer && fkOffer.price && fkOffer.price > 0) {
+        scrapedStores.push({
+          storeId: 'flipkart-live',
+          store: 'Flipkart',
+          storeSlug: 'flipkart',
+          logoUrl: 'https://img1a.flixcart.com/www/linchpin/fk-cp-zion/img/flipkart-plus_8d85f4.png',
+          price: fkOffer.price,
+          mrp: null,
+          shipping: 'Free',
+          shippingCost: 0,
+          availability: fkOffer.availability || 'In Stock',
+          stockStatus: fkOffer.stockStatus ?? StockStatus.IN_STOCK,
+          diff: 0,
+          url: fkOffer.directUrl || `https://www.flipkart.com/search?q=${encodeURIComponent(product.name)}`,
+          lastCheckedAt: new Date().toISOString(),
+        });
+      }
+    } catch (e) {
+      console.warn('[LiveStore] Flipkart dynamic scrape error:', e);
     }
   }
 
-  let stores = Array.from(storeMap.values());
-  stores.sort((a, b) => a.price - b.price);
+  const stores = [...scrapedStores].sort((a, b) => {
+    const aOut = a.stockStatus === StockStatus.OUT_OF_STOCK ? 1 : 0;
+    const bOut = b.stockStatus === StockStatus.OUT_OF_STOCK ? 1 : 0;
+    return aOut - bOut || a.price - b.price;
+  });
 
-  // Recompute relative diffs from the best available price
-  if (stores.length > 0) {
-    const lowest = stores[0].price;
-    stores = stores.map((s) => ({
-      ...s,
-      diff: Math.max(0, s.price - lowest),
-    }));
+  const lowestInStock = stores.find((s) => s.stockStatus !== StockStatus.OUT_OF_STOCK)?.price ?? stores[0]?.price ?? 0;
+  const finalStores = stores.map((s) => ({
+    ...s,
+    diff: s.stockStatus === StockStatus.OUT_OF_STOCK ? 0 : Math.max(0, s.price - lowestInStock),
+  }));
+
+  const bestInStock = finalStores.find((s) => s.stockStatus !== StockStatus.OUT_OF_STOCK) || finalStores[0];
+
+  if (forceRefresh) {
+    await persistLiveRatesToPostgres(productId, finalStores);
   }
 
   res.json({
-    stores,
-    bestDealUrl: stores[0]?.url || null,
+    stores: finalStores,
+    bestDealUrl: bestInStock?.url || null,
+    source: 'live_scraped',
+    refreshedAt: new Date().toISOString(),
   });
 };
 
@@ -259,9 +490,13 @@ export const getAlternatives = async (req: Request, res: Response): Promise<void
       });
       clearTimeout(timer);
       if (mlRes.ok) {
-        const payload = (await mlRes.json()) as { recommendations?: { product_id: string }[] };
-        if (payload.recommendations && payload.recommendations.length > 0) {
-          const recIds = payload.recommendations.map((r) => r.product_id);
+        const payload = (await mlRes.json()) as {
+          recommendations?: { product_id: string }[];
+          alternatives?: { product_id: string }[];
+        };
+        const recList = payload.alternatives || payload.recommendations;
+        if (recList && recList.length > 0) {
+          const recIds = recList.map((r) => r.product_id);
           const dbProducts = await prisma.product.findMany({
             where: { id: { in: recIds } },
             include: productInclude,
@@ -342,6 +577,48 @@ export const compareProducts = async (req: Request, res: Response): Promise<void
   });
 };
 
+/**
+ * Asynchronously refreshes real-time stock and pricing in the background upon store redirection,
+ * without blocking or delaying the user's outgoing navigation flow.
+ */
+async function refreshStockAndPriceAsync(
+  productId: string,
+  listingId: string | undefined,
+  directUrl: string,
+  storeName: string,
+  productName: string,
+  basePrice?: number | null,
+  targetSpecs?: TargetSpecs,
+): Promise<void> {
+  if (!listingId || !directUrl) return;
+
+  try {
+    const scraped = await scrapeLiveStoreListing(directUrl, storeName, productName, basePrice, targetSpecs);
+    if (!scraped) return;
+
+    const cleanPrice = scraped.price ? parsePrice(scraped.price) : 0;
+    const now = new Date();
+
+    await prisma.productStore.update({
+      where: { id: listingId },
+      data: {
+        ...(cleanPrice > 0 ? { currentPrice: cleanPrice } : {}),
+        stockStatus: scraped.stockStatus,
+        lastCheckedAt: now,
+      },
+    });
+
+    await refreshProductAggregates(productId);
+
+    // Invalidate caches so subsequent views are immediately fresh
+    const cleanQuery = productName.replace(/\(.*?\)/g, '').replace(/\b5g\b/gi, '').trim();
+    await livePriceCache.del(`serp_live::${cleanQuery.toLowerCase()}::`);
+    productDetailCache.delete(productId);
+  } catch (err: any) {
+    console.warn(`[AsyncStockRefresh] Background sync notice for ${productName}:`, err?.message || err);
+  }
+}
+
 export const redirectToStore = async (req: Request, res: Response): Promise<void> => {
   const productId = String(req.params.id);
   const requestedStore = (req.query.store as string) || '';
@@ -364,15 +641,48 @@ export const redirectToStore = async (req: Request, res: Response): Promise<void
 
   const storeName = listing?.store?.name || product.bestStore?.name || requestedStore || 'Amazon';
   const rawUrl = listing?.productUrl || '';
+  const targetSpecs = extractProductSpecs(product);
 
-  const directUrl = await resolveDirectStoreUrl(rawUrl, storeName, product.name);
+  let directUrl = await resolveDirectStoreUrl(rawUrl, storeName, product.name);
 
-  // If client wants JSON info instead of direct 302 redirect
+  // If redirecting to Flipkart, ensure the direct link matches the EXACT RAM & storage variant
+  if (storeName.toLowerCase().includes('flipkart') && (!directUrl.includes('/p/itm') || directUrl.includes('flipkart.com/search'))) {
+    try {
+
+      const fkScraped = await scrapeFlipkart('https://www.flipkart.com/search', product.bestPrice, product.name, targetSpecs);
+      if (fkScraped?.directUrl && fkScraped.directUrl.includes('/p/itm')) {
+        directUrl = fkScraped.directUrl;
+      }
+    } catch {
+      // Keep directUrl
+    }
+  }
+
+  // Strict URL-matching validation check before finalizing redirect
+  const validation = validateCanonicalProductUrl(directUrl, storeName, product);
+  const finalRedirectUrl = validation.isValid ? validation.canonicalUrl : validation.fallbackUrl;
+
+  // Asynchronously refresh real-time stock status without breaking or delaying outgoing navigation
+  setImmediate(() => {
+    refreshStockAndPriceAsync(product.id, listing?.id, finalRedirectUrl, storeName, product.name, product.bestPrice, targetSpecs)
+      .catch(() => {});
+  });
+
+  // If client wants JSON payload instead of direct 302 redirect
   if (req.query.format === 'json') {
-    res.json({ directUrl, storeName, productName: product.name });
+    res.json({
+      directUrl: finalRedirectUrl,
+      canonicalUrl: validation.canonicalUrl,
+      fallbackUrl: validation.fallbackUrl,
+      isValid: validation.isValid,
+      isFallback: validation.isFallback,
+      validationReason: validation.reason,
+      storeName,
+      productName: product.name,
+      stockStatus: listing?.stockStatus || StockStatus.IN_STOCK,
+    });
     return;
   }
 
-  res.redirect(directUrl);
+  res.redirect(finalRedirectUrl);
 };
-

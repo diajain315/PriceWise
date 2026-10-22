@@ -1,5 +1,12 @@
 import { env } from '../config/env';
 import { titleSimilarity, MATCH_THRESHOLD } from './matching';
+import { parsePrice, evaluateStockStatus, normalizeStoreOffer } from '../utils/priceNormalizer';
+import { isExactProductMatch } from '../utils/productMatcher';
+import { sanitizeRetailerUrl } from '../utils/urlSanitizer';
+import { livePriceCache } from '../utils/cache';
+import { cleanDestinationUrl } from './storeRedirectService';
+
+export { normalizeStoreOffer, isExactProductMatch, sanitizeRetailerUrl };
 
 export interface SerpStoreRate {
   storeId: string;
@@ -10,18 +17,69 @@ export interface SerpStoreRate {
   mrp: number | null;
   shipping: string;
   availability: string;
+  stockStatus: 'IN_STOCK' | 'LIMITED' | 'OUT_OF_STOCK';
   diff: number;
   url: string;
   lastCheckedAt?: string;
 }
 
-interface CacheEntry {
-  data: SerpStoreRate[];
-  expiresAt: number;
-}
+/**
+ * Extracts stock availability from SerpApi Google Shopping item attributes,
+ * safely evaluating string and boolean availability flags.
+ */
+export const parseStockStatus = (
+  item: any,
+): { availability: string; stockStatus: 'IN_STOCK' | 'LIMITED' | 'OUT_OF_STOCK' } => {
+  if (item?.in_stock !== undefined) {
+    const evaluated = evaluateStockStatus(item.in_stock);
+    if (!evaluated.inStock) {
+      return { availability: 'Out of Stock', stockStatus: 'OUT_OF_STOCK' };
+    }
+  }
 
-const memoryCache = new Map<string, CacheEntry>();
-const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes cache
+  const text = [
+    item?.availability,
+    item?.delivery,
+    item?.tag,
+    item?.snippet,
+    Array.isArray(item?.extensions) ? item.extensions.join(' ') : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
+
+  const evaluated = evaluateStockStatus(text, true);
+  return {
+    availability: evaluated.availability,
+    stockStatus: evaluated.stockStatus,
+  };
+};
+
+
+/**
+ * Resolves direct offer link from Google Shopping, unwrapping Google redirect if present
+ */
+export const resolveOfferUrl = (rawLink: string | undefined, fallbackUrl: string, storeName = ''): string => {
+  if (!rawLink || typeof rawLink !== 'string') return sanitizeRetailerUrl(fallbackUrl, storeName);
+  const trimmed = rawLink.trim();
+  if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
+    return sanitizeRetailerUrl(fallbackUrl, storeName);
+  }
+
+  let dest = trimmed;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.hostname.includes('google.')) {
+      const target = parsed.searchParams.get('url') || parsed.searchParams.get('q') || parsed.searchParams.get('adurl');
+      if (target && (target.startsWith('http://') || target.startsWith('https://'))) {
+        dest = target;
+      }
+    }
+  } catch {
+    // Ignore URL parse errors and return trimmed
+  }
+  const cleaned = cleanDestinationUrl(dest);
+  return sanitizeRetailerUrl(cleaned, storeName);
+};
 
 const ACCESSORY_KEYWORDS = [
   'case',
@@ -181,6 +239,7 @@ export const getLiveSerpStorePrices = async (
   productName: string,
   brandName = '',
   basePrice?: number | null,
+  forceRefresh = false,
 ): Promise<SerpStoreRate[]> => {
   if (!productName || !env.serpApiKey) return [];
 
@@ -191,11 +250,16 @@ export const getLiveSerpStorePrices = async (
     .replace(/\b4g\b/gi, '')
     .replace(/\s+/g, ' ')
     .trim();
-  const cacheKey = `${cleanQuery.toLowerCase()}::${(brandName || '').toLowerCase()}`;
+  const cacheKey = `serp_live::${cleanQuery.toLowerCase()}::${(brandName || '').toLowerCase()}`;
 
-  const cached = memoryCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) {
-    return cached.data;
+  if (!forceRefresh) {
+    const cached = await livePriceCache.get<SerpStoreRate[]>(cacheKey);
+    if (cached && Array.isArray(cached) && cached.length > 0) {
+      return cached;
+    }
+  } else {
+    await livePriceCache.evict(cacheKey);
+    await livePriceCache.invalidatePattern(`serp_live::${cleanQuery.toLowerCase()}*`);
   }
 
   try {
@@ -237,14 +301,14 @@ export const getLiveSerpStorePrices = async (
       price: number;
       directUrl: string;
       shipping: string;
+      availability: string;
+      stockStatus: 'IN_STOCK' | 'LIMITED' | 'OUT_OF_STOCK';
     }[] = [];
 
     for (const item of shoppingResults) {
-      let rawPrice = Number(item.extracted_price ?? item.price?.replace(/[^0-9.]/g, ''));
-      if (!rawPrice || isNaN(rawPrice)) continue;
-
-      const price = (item.price && item.price.includes('$')) ? Math.round(rawPrice * 86) : Math.round(rawPrice);
-      if (price < minThreshold) continue;
+      // Robust normalized price parsing
+      const price = parsePrice(item.extracted_price ?? item.price, { minThreshold });
+      if (!price || price < minThreshold) continue;
 
       // Price tolerance check against catalog base price (prevent mismatched luxury items or accessories)
       if (typeof basePrice === 'number' && basePrice > 0) {
@@ -268,17 +332,27 @@ export const getLiveSerpStorePrices = async (
       const match = matchAllowedStore(item.source || '', brandName, productName);
       if (!match) continue; // Completely ignore any other website
 
+      const stock = parseStockStatus(item);
+      const offerUrl = resolveOfferUrl(item.link || item.product_link, match.directUrl, match.displayName);
+
       validOffers.push({
         storeKey: match.key,
         storeName: match.displayName,
         price,
-        directUrl: match.directUrl,
+        directUrl: offerUrl,
         shipping: item.delivery && !item.delivery.toLowerCase().includes('₹') ? item.delivery : 'Free',
+        availability: stock.availability,
+        stockStatus: stock.stockStatus,
       });
     }
 
-    // Sort by price ascending
-    validOffers.sort((a, b) => a.price - b.price);
+    // Sort: In Stock first, then ascending by price
+    validOffers.sort((a, b) => {
+      const aOut = a.stockStatus === 'OUT_OF_STOCK' ? 1 : 0;
+      const bOut = b.stockStatus === 'OUT_OF_STOCK' ? 1 : 0;
+      if (aOut !== bOut) return aOut - bOut;
+      return a.price - b.price;
+    });
 
     // Keep best rate for each unique store
     const seenStores = new Set<string>();
@@ -294,7 +368,8 @@ export const getLiveSerpStorePrices = async (
 
     if (topOffers.length === 0) return [];
 
-    const bestPrice = topOffers[0].price;
+    const bestInStock = topOffers.find((o) => o.stockStatus !== 'OUT_OF_STOCK') || topOffers[0];
+    const bestPrice = bestInStock.price;
 
     const formatted: SerpStoreRate[] = topOffers.map((offer, index) => ({
       storeId: `serp_${offer.storeKey}_${index}`,
@@ -304,16 +379,14 @@ export const getLiveSerpStorePrices = async (
       price: offer.price,
       mrp: estimatedPrice > offer.price ? Math.round(estimatedPrice * 1.15) : null,
       shipping: offer.shipping,
-      availability: 'In Stock',
-      diff: Math.round(offer.price - bestPrice),
+      availability: offer.availability,
+      stockStatus: offer.stockStatus,
+      diff: Math.max(0, Math.round(offer.price - bestPrice)),
       url: offer.directUrl,
       lastCheckedAt: new Date().toISOString(),
     }));
 
-    memoryCache.set(cacheKey, {
-      data: formatted,
-      expiresAt: Date.now() + CACHE_TTL_MS,
-    });
+    await livePriceCache.set(cacheKey, formatted, 30); // 30s TTL for real-time responsiveness
 
     return formatted;
   } catch (err: any) {
