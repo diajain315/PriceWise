@@ -9,6 +9,7 @@ import type {
   StorePriceRow,
   PricePoint,
   PredictionPoint,
+  ProductPredictionResult,
 } from '../types/product';
 import type {
   User,
@@ -20,7 +21,13 @@ import type {
   NotificationsResponse,
 } from '../types/user';
 
-const API_BASE = '/api';
+const normalizeApiBase = (url?: string): string => {
+  if (!url || !url.trim()) return '/api';
+  const trimmed = url.trim().replace(/\/+$/, '');
+  return trimmed.endsWith('/api') ? trimmed : `${trimmed}/api`;
+};
+
+const API_BASE = normalizeApiBase(import.meta.env.VITE_API_URL || (import.meta.env as any).API_URL);
 
 export const apiClient = axios.create({
   baseURL: API_BASE,
@@ -135,14 +142,17 @@ export const api = {
     return res.data;
   },
 
-  async getProduct(id: string): Promise<ProductDetailResponse> {
-    const res = await apiClient.get<ProductDetailResponse>(`/products/${encodeURIComponent(id)}`);
+  async getProduct(id: string, refresh = false): Promise<ProductDetailResponse> {
+    const res = await apiClient.get<ProductDetailResponse>(`/products/${encodeURIComponent(id)}`, {
+      params: refresh ? { refresh: 'true' } : undefined,
+    });
     return res.data;
   },
 
-  async getLiveStores(id: string): Promise<{ stores: StorePriceRow[]; bestDealUrl: string | null }> {
-    const res = await apiClient.get<{ stores: StorePriceRow[]; bestDealUrl: string | null }>(
-      `/products/${encodeURIComponent(id)}/live-stores`
+  async getLiveStores(id: string, refresh = true): Promise<{ stores: StorePriceRow[]; bestDealUrl: string | null; source?: string }> {
+    const res = await apiClient.get<{ stores: StorePriceRow[]; bestDealUrl: string | null; source?: string }>(
+      `/products/${encodeURIComponent(id)}/live-stores`,
+      { params: refresh ? { refresh: 'true' } : undefined }
     );
     return res.data;
   },
@@ -154,9 +164,24 @@ export const api = {
     return res.data?.points || (Array.isArray(res.data) ? res.data : []);
   },
 
-  async getProductPrediction(id: string): Promise<PredictionPoint[]> {
+  async getProductPrediction(id: string): Promise<ProductPredictionResult> {
     const res = await apiClient.get<any>(`/products/${encodeURIComponent(id)}/prediction`);
-    return res.data?.points || (Array.isArray(res.data) ? res.data : []);
+    const data = res.data || {};
+    const points: PredictionPoint[] = data?.points || (Array.isArray(data) ? data : []);
+    return {
+      productId: data?.productId || id,
+      points,
+      predicted7d: Number(data?.predicted7d ?? 0),
+      predicted30d: Number(data?.predicted30d ?? 0),
+      potentialSaving: Number(data?.potentialSaving ?? 0),
+      confidence: data?.confidence || 'Moderate',
+      recommendation: data?.recommendation || 'MONITOR',
+      explanation: data?.explanation,
+      trend: data?.trend,
+      source: data?.source || 'ml-service',
+      insufficientData: Boolean(data?.insufficientData),
+      disclaimer: data?.disclaimer,
+    };
   },
 
   async getProductAlternatives(id: string): Promise<Product[]> {
@@ -187,10 +212,11 @@ export const api = {
     return res.data;
   },
 
-  async askAI(message: string, productIds?: string[]): Promise<AIChatResponse> {
+  async askAI(message: string, productIds?: string[], sessionId?: string): Promise<AIChatResponse> {
     const res = await apiClient.post<AIChatResponse>('/intelligence/ai', {
       message,
       productIds,
+      sessionId,
     });
     return res.data;
   },

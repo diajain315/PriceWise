@@ -2,7 +2,8 @@ import { useState, useEffect } from "react"
 import { useParams, useNavigate } from "react-router"
 import {
   Star, Heart, Bell, GitCompare, ExternalLink, Sparkles,
-  CheckCircle, ChevronRight, Info, Loader2
+  CheckCircle, ChevronRight, Info, Loader2, RefreshCw,
+  AlertTriangle, TrendingUp
 } from "lucide-react"
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
@@ -14,7 +15,7 @@ import CompareButton from "../components/ui/CompareButton"
 import PriceAlertModal from "../components/ui/PriceAlertModal"
 import { api } from "../services/api"
 import { useAuth } from "../context/AuthContext"
-import type { Product, ProductDetailResponse, StorePriceRow, PricePoint, PredictionPoint } from "../types/product"
+import type { Product, ProductDetailResponse, StorePriceRow, PricePoint, PredictionPoint, ProductPredictionResult } from "../types/product"
 
 const fmt = (n: number) => "₹" + n.toLocaleString("en-IN")
 
@@ -30,6 +31,7 @@ export default function ProductDetail() {
   const [detail, setDetail] = useState<ProductDetailResponse | null>(null)
   const [history, setHistory] = useState<PricePoint[]>([])
   const [prediction, setPrediction] = useState<PredictionPoint[]>([])
+  const [predictionData, setPredictionData] = useState<ProductPredictionResult | null>(null)
   const [alternatives, setAlternatives] = useState<Product[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -91,7 +93,7 @@ export default function ProductDetail() {
 
         // 2. Fetch live SerpApi Google Shopping stores (fast background call)
         setLiveStoresLoading(true)
-        api.getLiveStores(id!)
+        api.getLiveStores(id!, true)
           .then((res) => {
             if (isMounted && res.stores && res.stores.length > 0) {
               setLiveStores(res.stores)
@@ -105,12 +107,17 @@ export default function ProductDetail() {
         // 3. Load history, predictions, and alternatives in background (non-blocking)
         Promise.all([
           api.getProductHistory(id!).catch(() => []),
-          api.getProductPrediction(id!).catch(() => []),
+          api.getProductPrediction(id!).catch(() => null),
           api.getProductAlternatives(id!).catch(() => []),
-        ]).then(([historyPoints, predPoints, alts]) => {
+        ]).then(([historyPoints, predResult, alts]) => {
           if (!isMounted) return
           if (historyPoints && historyPoints.length > 0) setHistory(historyPoints)
-          if (predPoints && predPoints.length > 0) setPrediction(predPoints)
+          if (predResult) {
+            setPredictionData(predResult)
+            if (predResult.points && predResult.points.length > 0) {
+              setPrediction(predResult.points)
+            }
+          }
           if (alts && alts.length > 0) setAlternatives(alts)
         })
       } catch (err: any) {
@@ -145,6 +152,26 @@ export default function ProductDetail() {
     }
   }, [detail, targetPrice])
 
+  const handleRefreshLivePrices = async () => {
+    if (!id || liveStoresLoading) return
+    setLiveStoresLoading(true)
+    try {
+      const res = await api.getLiveStores(id, true)
+      if (res.stores && res.stores.length > 0) {
+        setLiveStores(res.stores)
+      }
+      // Re-fetch product details to synchronize UI with PostgreSQL records updated by the live sync
+      const refreshedDetail = await api.getProduct(id, true)
+      if (refreshedDetail) {
+        setDetail(refreshedDetail)
+      }
+    } catch (err) {
+      console.error("Failed to refresh live store prices:", err)
+    } finally {
+      setLiveStoresLoading(false)
+    }
+  }
+
   if (loading) {
     return (
       <div className="min-h-screen bg-[#f4f6fb] pt-24 flex items-center justify-center">
@@ -175,32 +202,25 @@ export default function ProductDetail() {
     )
   }
 
-  // Merge verified database stores and auxiliary live stores with database priority
+  // 1. Primary ground truth: If liveStores has arrived from SerpApi, it is the 100% real-time source of truth
   const dbStores: StorePriceRow[] = detail.storePrices || (Array.isArray(detail.stores) ? (detail.stores as unknown as StorePriceRow[]) : [])
-  const storeMap = new Map<string, StorePriceRow>()
+  let stores: StorePriceRow[] = (liveStores && liveStores.length > 0)
+    ? liveStores
+    : dbStores
 
-  // 1. Verified database listings are ground truth
-  for (const s of dbStores) {
-    storeMap.set(s.store.toLowerCase(), s)
-  }
-
-  // 2. Only add live stores that do not conflict with verified database stores
-  if (liveStores && liveStores.length > 0) {
-    for (const s of liveStores) {
-      const key = s.store.toLowerCase()
-      if (!storeMap.has(key)) {
-        storeMap.set(key, s)
-      }
-    }
-  }
-
-  let stores: StorePriceRow[] = Array.from(storeMap.values())
   if (stores.length > 0) {
-    stores.sort((a, b) => a.price - b.price)
-    const lowest = stores[0].price
+    // Sort: In Stock stores first (sorted by price ascending), then Limited, then Out of Stock
+    stores.sort((a, b) => {
+      const isOutA = a.stockStatus === "OUT_OF_STOCK" || a.availability === "Out of Stock" ? 1 : 0
+      const isOutB = b.stockStatus === "OUT_OF_STOCK" || b.availability === "Out of Stock" ? 1 : 0
+      if (isOutA !== isOutB) return isOutA - isOutB
+      return a.price - b.price
+    })
+    const firstInStock = stores.find((s) => s.stockStatus !== "OUT_OF_STOCK" && s.availability !== "Out of Stock") || stores[0]
+    const lowest = firstInStock.price
     stores = stores.map((s) => ({
       ...s,
-      diff: Math.max(0, s.price - lowest),
+      diff: (s.stockStatus === "OUT_OF_STOCK" || s.availability === "Out of Stock") ? 0 : Math.max(0, s.price - lowest),
     }))
   } else if (product.bestStore) {
     stores = [{
@@ -213,12 +233,21 @@ export default function ProductDetail() {
       diff: 0,
       url: (product as any).affiliateUrl || (product as any).url || '',
       availability: 'In Stock',
+      stockStatus: 'IN_STOCK',
       shipping: 'Free',
+      shippingCost: 0,
+      lastCheckedAt: new Date().toISOString(),
     }]
   }
 
-  const currentBestPrice = stores.length > 0 ? stores[0].price : (product.bestPrice || 0)
-  const currentBestStore = stores.length > 0 ? stores[0].store : (product.bestStore || "Amazon")
+  const inStockStores = stores.filter(
+    (s) => s.stockStatus !== "OUT_OF_STOCK" && s.availability !== "Out of Stock"
+  )
+  const isAllOutOfStock = stores.length > 0 && inStockStores.length === 0
+  const bestAvailableStore = inStockStores.length > 0 ? inStockStores[0] : stores[0]
+
+  const currentBestPrice = bestAvailableStore ? bestAvailableStore.price : (product.bestPrice || 0)
+  const currentBestStore = bestAvailableStore ? bestAvailableStore.store : (product.bestStore || "Amazon")
   const currentMrp = product.mrp && product.mrp > currentBestPrice ? product.mrp : Math.round(currentBestPrice * 1.15)
   const savings = Math.max(0, currentMrp - currentBestPrice)
   const discountPct = Math.round(((currentMrp - currentBestPrice) / currentMrp) * 100)
@@ -226,6 +255,154 @@ export default function ProductDetail() {
   const stats = detail.stats
   const verdict = detail.verdict
   const insights = detail.insights || []
+
+  // Real dynamic AI recommendation & confidence derived directly from ML service or live series
+  const effectiveRecommendation: 'BUY' | 'WAIT' | 'MONITOR' = (
+    predictionData?.recommendation
+      ? (predictionData.recommendation.toUpperCase().includes('BUY') ? 'BUY' : predictionData.recommendation.toUpperCase().includes('WAIT') ? 'WAIT' : 'MONITOR')
+      : (verdict?.recommendation
+          ? (verdict.recommendation.toUpperCase().includes('BUY') ? 'BUY' : verdict.recommendation.toUpperCase().includes('WAIT') ? 'WAIT' : 'MONITOR')
+          : (discountPct >= 12 ? 'BUY' : 'MONITOR'))
+  )
+
+  const effectiveConfidence = (
+    predictionData?.confidence && predictionData.confidence !== 'Insufficient Data'
+      ? predictionData.confidence
+      : (verdict?.confidence || (stores.length >= 2 ? 'High' : 'Moderate'))
+  )
+
+  const effectiveVerdictLabel = (() => {
+    if (predictionData?.recommendation) {
+      if (effectiveRecommendation === 'BUY') return 'Buy Now — Favorable Buying Window'
+      if (effectiveRecommendation === 'WAIT') return 'Wait for Deal — Price Softening Projected'
+      return 'Monitor Price — Trade In Stable Range'
+    }
+    return verdict?.label || verdict?.summary || (effectiveRecommendation === 'BUY' ? 'Good time to buy' : 'Monitor price')
+  })()
+
+  const dynamicVerdictExplanation = (() => {
+    if (predictionData?.explanation) return predictionData.explanation
+    if (verdict?.explanation) return verdict.explanation
+    if (verdict?.reason) return verdict.reason
+
+    if (discountPct >= 10 && savings > 0) {
+      return `Current best price of ${fmt(currentBestPrice)} is ${discountPct}% below MRP (${fmt(currentMrp)}). Verified across ${stores.length} retailer stores.`
+    }
+    if (stats?.average90) {
+      const diffPct = Math.round(((currentBestPrice - stats.average90) / stats.average90) * 100)
+      if (diffPct < 0) return `Current price of ${fmt(currentBestPrice)} is ${Math.abs(diffPct)}% below its 90-day typical average (${fmt(stats.average90)}).`
+      if (diffPct > 0) return `Current price of ${fmt(currentBestPrice)} is ${diffPct}% above its 90-day typical average (${fmt(stats.average90)}).`
+      return `Current price is aligned with its 90-day recorded baseline of ${fmt(stats.average90)}.`
+    }
+    return `Verified live stock across ${stores.length} retailer listings with lowest rate on ${currentBestStore}.`
+  })()
+
+  const verdictTheme = {
+    BUY: {
+      bg: "bg-emerald-50/90",
+      border: "border-emerald-200",
+      title: "text-emerald-900",
+      body: "text-emerald-800",
+      iconBg: "bg-emerald-100",
+      iconColor: "text-emerald-600",
+      badgeVariant: "success" as const,
+      badgeText: "Buy Now",
+    },
+    WAIT: {
+      bg: "bg-amber-50/90",
+      border: "border-amber-200",
+      title: "text-amber-900",
+      body: "text-amber-800",
+      iconBg: "bg-amber-100",
+      iconColor: "text-amber-600",
+      badgeVariant: "warning" as const,
+      badgeText: "Wait for Drop",
+    },
+    MONITOR: {
+      bg: "bg-sky-50/90",
+      border: "border-sky-200",
+      title: "text-sky-900",
+      body: "text-sky-800",
+      iconBg: "bg-sky-100",
+      iconColor: "text-sky-600",
+      badgeVariant: "neutral" as const,
+      badgeText: "Monitor Price",
+    },
+  }[effectiveRecommendation]
+
+  // Pure dynamic AI insights with ZERO static or placeholder strings
+  const effectiveInsights = (() => {
+    const list: { type: 'check' | 'warn' | 'info'; label: string; text: string }[] = []
+
+    // 1. Incorporate backend dynamic insights (from real 90d/30d series stats)
+    if (Array.isArray(detail?.insights)) {
+      for (const ins of detail.insights) {
+        if (ins && (ins.text || ins.value)) {
+          list.push({
+            type: ins.type === 'warn' ? 'warn' : 'check',
+            label: ins.label || (ins.type === 'warn' ? 'Market Alert' : 'Price Advantage'),
+            text: ins.text || ins.value || '',
+          })
+        }
+      }
+    }
+
+    // 2. ML Prediction Horizon Insight (if predictionData is loaded)
+    if (predictionData && predictionData.predicted30d > 0) {
+      if (predictionData.potentialSaving > 0) {
+        list.push({
+          type: 'check',
+          label: '30-Day ML Forecast Saving',
+          text: `Machine learning models project potential savings of ${fmt(predictionData.potentialSaving)} with a forecast target of ${fmt(predictionData.predicted30d)} within 30 days.`,
+        })
+      } else if (predictionData.predicted30d > currentBestPrice * 1.02) {
+        list.push({
+          type: 'warn',
+          label: '30-Day ML Price Projection',
+          text: `Model forecasts upward price pressure toward ${fmt(predictionData.predicted30d)} (+${Math.round(((predictionData.predicted30d - currentBestPrice) / currentBestPrice) * 100)}%). Buying now avoids impending increases.`,
+        })
+      } else {
+        list.push({
+          type: 'info',
+          label: '30-Day ML Forecast Stability',
+          text: `Prophet & XGBoost models project price stability near ${fmt(predictionData.predicted30d)} across verified retailers.`,
+        })
+      }
+    }
+
+    // 3. Cross-Store Price Spread (Asymmetry between verified retailers)
+    if (inStockStores.length > 1) {
+      const highestInStock = Math.max(...inStockStores.map((s) => s.price))
+      const storeSpread = highestInStock - currentBestPrice
+      if (storeSpread > 0) {
+        list.push({
+          type: 'check',
+          label: 'Cross-Retailer Price Asymmetry',
+          text: `Save up to ${fmt(storeSpread)} by purchasing on ${currentBestStore} (${fmt(currentBestPrice)}) instead of higher-priced retailer listings (${fmt(highestInStock)}).`,
+        })
+      }
+    }
+
+    // 4. Historical Lowest Price recorded
+    if (stats?.lowestEver && currentBestPrice <= stats.lowestEver * 1.01) {
+      list.push({
+        type: 'check',
+        label: 'Historical Benchmark',
+        text: `Current price of ${fmt(currentBestPrice)} is at or near the all-time lowest recorded price (${fmt(stats.lowestEver)}) for this device.`,
+      })
+    }
+
+    // 5. MRP Discount Savings
+    if (savings > 0 && discountPct >= 10) {
+      list.push({
+        type: 'check',
+        label: 'Manufacturer MRP Discount',
+        text: `${discountPct}% direct savings (${fmt(savings)}) against official MRP of ${fmt(currentMrp)}.`,
+      })
+    }
+
+    return list
+  })()
 
   const avgPrice = stats?.average90 || product.bestPrice
   const lowestPrice = stats?.lowestEver || stats?.lowest90 || product.bestPrice
@@ -271,6 +448,16 @@ export default function ProductDetail() {
       if (finalUrl.includes("vijaysales.com/search/") && !finalUrl.includes("?q=")) {
         const rawQ = finalUrl.replace(/^https?:\/\/(?:www\.)?vijaysales\.com\/search\//i, "")
         finalUrl = `https://www.vijaysales.com/search?q=${rawQ}`
+      }
+      // Auto-correct Croma discontinued URLs to prevent landing on search?q=null
+      if (finalUrl.includes("croma.com")) {
+        const cleanQ = encodeURIComponent((product.name || "smartphone").replace(/\(.*?\)/g, "").trim())
+        if (
+                    finalUrl.includes("null") ||
+          finalUrl.includes("{search_term_string}")
+        ) {
+          return `https://www.croma.com/searchB?q=${cleanQ}`
+        }
       }
       if (isDirectProductUrl(finalUrl)) {
         return finalUrl
@@ -419,49 +606,71 @@ export default function ProductDetail() {
                     <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
                     Live Store Prices:
                   </span>
-                  <span className="text-[11px] text-slate-400">Current Selling Prices</span>
+                  <button
+                    onClick={handleRefreshLivePrices}
+                    disabled={liveStoresLoading}
+                    className="inline-flex items-center gap-1 text-[11px] text-indigo-600 hover:text-indigo-800 disabled:opacity-50 font-medium cursor-pointer"
+                    title="Check current stock and live prices across stores"
+                  >
+                    <RefreshCw size={10} className={liveStoresLoading ? "animate-spin" : ""} />
+                    {liveStoresLoading ? "Checking..." : "Refresh Live Stock"}
+                  </button>
                 </div>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                   {stores.length > 0 ? (
-                    stores.map((s, idx) => (
-                      <a
-                        key={s.storeId || s.store || idx}
-                        href={getDirectBuyUrl(s)}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className={`flex items-center justify-between px-3 py-2.5 rounded-xl border transition-all text-xs group ${
-                          idx === 0
-                            ? "bg-emerald-50/80 border-emerald-300 text-emerald-950 font-semibold shadow-2xs"
-                            : "bg-white border-slate-200 text-slate-700 hover:border-indigo-300 hover:bg-slate-50"
-                        }`}
-                      >
-                        <div className="flex items-center gap-1.5 flex-wrap">
-                          <span className="font-bold text-slate-900">{s.store}</span>
-                          {idx === 0 ? (
-                            <span className="bg-emerald-200 text-emerald-800 text-[10px] px-1.5 py-0.2 rounded font-bold">
-                              Lowest
-                            </span>
-                          ) : s.diff > 0 ? (
-                            <span className="text-[10px] text-slate-500">
-                              +{fmt(s.diff)}
-                            </span>
-                          ) : null}
-                          {isDirectProductUrl(s.url) ? (
-                            <span className="bg-sky-100 text-sky-800 text-[9px] px-1 py-0.2 rounded font-semibold" title="Direct verified store product page">
-                              Direct Page
-                            </span>
-                          ) : (
-                            <span className="bg-slate-100 text-slate-600 text-[9px] px-1 py-0.2 rounded" title="Store keyword search">
-                              Search
-                            </span>
-                          )}
-                        </div>
-                        <div className="flex items-center gap-1.5">
-                          <span className="text-sm font-bold font-mono text-slate-900">{fmt(s.price)}</span>
-                          <ExternalLink size={12} className="text-slate-400 group-hover:text-indigo-600 transition-colors" />
-                        </div>
-                      </a>
-                    ))
+                    stores.map((s, idx) => {
+                      const isOut = s.stockStatus === 'OUT_OF_STOCK' || s.availability === 'Out of Stock'
+                      const isLimited = s.stockStatus === 'LIMITED' || s.availability === 'Limited Stock'
+                      return (
+                        <a
+                          key={s.storeId || s.store || idx}
+                          href={getDirectBuyUrl(s)}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className={`flex items-center justify-between px-3 py-2.5 rounded-xl border transition-all text-xs group ${
+                            isOut
+                              ? "bg-slate-50 border-slate-200 text-slate-500 opacity-80 hover:border-slate-300 hover:bg-slate-100/70 cursor-pointer"
+                              : idx === 0 && !isOut
+                              ? "bg-emerald-50/80 border-emerald-300 text-emerald-950 font-semibold shadow-2xs"
+                              : "bg-white border-slate-200 text-slate-700 hover:border-indigo-300 hover:bg-slate-50"
+                          }`}
+                        >
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <span className={`font-bold ${isOut ? "text-slate-500 line-through" : "text-slate-900"}`}>{s.store}</span>
+                            {isOut ? (
+                              <span className="bg-red-100 text-red-700 text-[9px] px-1.5 py-0.2 rounded font-bold">
+                                Out of Stock
+                              </span>
+                            ) : isLimited ? (
+                              <span className="bg-amber-100 text-amber-800 text-[9px] px-1.5 py-0.2 rounded font-medium">
+                                Few Left
+                              </span>
+                            ) : idx === 0 ? (
+                              <span className="bg-emerald-200 text-emerald-800 text-[10px] px-1.5 py-0.2 rounded font-bold">
+                                Lowest
+                              </span>
+                            ) : s.diff > 0 ? (
+                              <span className="text-[10px] text-slate-500">
+                                +{fmt(s.diff)}
+                              </span>
+                            ) : null}
+                            {!isOut && (isDirectProductUrl(s.url) ? (
+                              <span className="bg-sky-100 text-sky-800 text-[9px] px-1 py-0.2 rounded font-semibold" title="Direct verified store product page">
+                                Direct Page
+                              </span>
+                            ) : (
+                              <span className="bg-slate-100 text-slate-600 text-[9px] px-1 py-0.2 rounded" title="Store keyword search">
+                                Search
+                              </span>
+                            ))}
+                          </div>
+                          <div className="flex items-center gap-1.5">
+                            <span className={`text-sm font-bold font-mono ${isOut ? "text-slate-400 line-through" : "text-slate-900"}`}>{fmt(s.price)}</span>
+                            {!isOut && <ExternalLink size={12} className="text-slate-400 group-hover:text-indigo-600 transition-colors" />}
+                          </div>
+                        </a>
+                      )
+                    })
                   ) : (
                     <div className="flex items-center justify-between px-3 py-2.5 rounded-xl bg-white border border-slate-200 text-xs col-span-2">
                       <span className="font-bold text-slate-900">{product.bestStore || "Amazon"} Store</span>
@@ -471,14 +680,23 @@ export default function ProductDetail() {
                 </div>
               </div>
 
-              <a
-                href={getDirectBuyUrl(stores[0])}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-3 px-4 rounded-xl transition-colors flex items-center justify-center gap-2 mb-2 shadow-md shadow-indigo-600/20"
-              >
-                View Best Deal at {stores[0]?.store || product.bestStore || "Amazon"} {isDirectProductUrl(stores[0]?.url) ? "(Direct Listing)" : ""} <ExternalLink size={15} />
-              </a>
+              {isAllOutOfStock ? (
+                <button
+                  onClick={() => openTrackModal(product)}
+                  className="w-full bg-amber-600 hover:bg-amber-700 text-white font-semibold py-3 px-4 rounded-xl transition-colors flex items-center justify-center gap-2 mb-2 shadow-md shadow-amber-600/20 cursor-pointer"
+                >
+                  <Bell size={15} /> Currently Out of Stock Everywhere — Track for Restock Alerts
+                </button>
+              ) : (
+                <a
+                  href={getDirectBuyUrl(bestAvailableStore)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-3 px-4 rounded-xl transition-colors flex items-center justify-center gap-2 mb-2 shadow-md shadow-indigo-600/20"
+                >
+                  View Best Deal at {currentBestStore} {isDirectProductUrl(bestAvailableStore?.url) ? "(Direct Listing)" : ""} <ExternalLink size={15} />
+                </a>
+              )}
 
               <div className="grid grid-cols-3 gap-2">
                 <button
@@ -522,19 +740,29 @@ export default function ProductDetail() {
             </div>
 
             {/* AI Verdict */}
-            <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-4 mb-4">
-              <div className="flex items-center gap-2 mb-2">
-                <div className="w-7 h-7 bg-emerald-100 rounded-lg flex items-center justify-center">
-                  <Sparkles size={13} className="text-emerald-600" />
+            <div className={`${verdictTheme.bg} border ${verdictTheme.border} rounded-2xl p-4 mb-4 transition-all shadow-2xs`}>
+              <div className="flex items-center gap-2 mb-2 flex-wrap">
+                <div className={`w-7 h-7 ${verdictTheme.iconBg} rounded-lg flex items-center justify-center shrink-0`}>
+                  <Sparkles size={13} className={verdictTheme.iconColor} />
                 </div>
-                <p className="text-sm font-semibold text-emerald-800">PriceWise Intelligence Verdict</p>
-                <Badge variant="success" className="ml-auto">High Confidence</Badge>
+                <p className={`text-sm font-semibold ${verdictTheme.title}`}>PriceWise Intelligence Verdict</p>
+                <div className="ml-auto flex items-center gap-1.5 flex-wrap">
+                  <Badge variant={verdictTheme.badgeVariant}>{verdictTheme.badgeText}</Badge>
+                  <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full ${
+                    effectiveConfidence.toLowerCase().includes('high') ? 'bg-emerald-100 text-emerald-800' :
+                    effectiveConfidence.toLowerCase().includes('mod') ? 'bg-amber-100 text-amber-800' :
+                    'bg-slate-100 text-slate-700'
+                  }`}>
+                    {effectiveConfidence} Confidence
+                  </span>
+                </div>
               </div>
-              <p className="text-base font-bold text-emerald-800 mb-1">
-                ✓ {verdict?.summary || verdict?.label || product.aiVerdict}
+              <p className={`text-base font-bold ${verdictTheme.title} mb-1 flex items-center gap-1.5`}>
+                <span>{effectiveRecommendation === 'BUY' ? '✓' : effectiveRecommendation === 'WAIT' ? '⏳' : '📊'}</span>
+                <span>{effectiveVerdictLabel}</span>
               </p>
-              <p className="text-sm text-emerald-700">
-                {verdict?.reason || verdict?.explanation || `Current price of ${fmt(product.bestPrice)} is ${product.discount}% lower than estimated retail value. Top price consistency across verified retailers.`}
+              <p className={`text-sm ${verdictTheme.body} leading-relaxed`}>
+                {dynamicVerdictExplanation}
               </p>
             </div>
 
@@ -550,18 +778,31 @@ export default function ProductDetail() {
         {/* Store Price Comparison Table */}
         <div id="stores" className="bg-white rounded-2xl border border-slate-200 p-6 mb-6 shadow-sm">
           <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
-            <h2 className="text-lg font-bold text-slate-900">Verified Retailers & Live Prices</h2>
-            {liveStoresLoading ? (
-              <div className="flex items-center gap-1.5 text-xs text-indigo-600 bg-indigo-50 px-2.5 py-1 rounded-full font-medium">
-                <Loader2 size={12} className="animate-spin" />
-                <span>Checking live store prices...</span>
-              </div>
-            ) : liveStores && liveStores.length > 0 ? (
-              <span className="text-[11px] font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2.5 py-0.5 rounded-full inline-flex items-center gap-1">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                Live Google Shopping Rates
-              </span>
-            ) : null}
+            <div>
+              <h2 className="text-lg font-bold text-slate-900">Verified Retailers & Live Stock</h2>
+              <p className="text-xs text-slate-500 mt-0.5">Real-time availability, retailer prices and direct store listings</p>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={handleRefreshLivePrices}
+                disabled={liveStoresLoading}
+                className="inline-flex items-center gap-1.5 text-xs bg-slate-100 hover:bg-slate-200 text-slate-700 px-3 py-1.5 rounded-lg font-medium transition-colors cursor-pointer disabled:opacity-50"
+              >
+                <RefreshCw size={12} className={liveStoresLoading ? "animate-spin text-indigo-600" : ""} />
+                <span>{liveStoresLoading ? "Checking Live..." : "Refresh Live Stock"}</span>
+              </button>
+              {liveStoresLoading ? (
+                <span className="text-[11px] font-medium text-indigo-700 bg-indigo-50 border border-indigo-200 px-2.5 py-1 rounded-full inline-flex items-center gap-1.5">
+                  <RefreshCw size={11} className="animate-spin text-indigo-600" />
+                  Fetching Live Rates...
+                </span>
+              ) : liveStores && liveStores.length > 0 ? (
+                <span className="text-[11px] font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded-full inline-flex items-center gap-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                  Live Real-Time Rates
+                </span>
+              ) : null}
+            </div>
           </div>
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
@@ -577,60 +818,83 @@ export default function ProductDetail() {
               </thead>
               <tbody className="divide-y divide-slate-50">
                 {stores.length > 0 ? (
-                  stores.map((store, i) => (
-                    <tr
-                      key={store.storeId || store.store || i}
-                      className={`${i === 0 ? "bg-emerald-50/50" : ""} hover:bg-slate-50 transition-colors`}
-                    >
-                      <td className="py-3 pr-4">
-                        <div className="flex items-center gap-2">
-                          <span className="w-8 h-8 rounded-lg bg-indigo-50 text-indigo-700 font-bold flex items-center justify-center text-xs">
-                            {store.store.charAt(0)}
-                          </span>
-                          <div>
-                            <p className="font-semibold text-slate-800">{store.store}</p>
-                            {i === 0 && <span className="text-[10px] bg-emerald-100 text-emerald-700 px-1.5 py-0.5 rounded-full font-medium">Best Price</span>}
+                  stores.map((store, i) => {
+                    const isOut = store.stockStatus === 'OUT_OF_STOCK' || store.availability === 'Out of Stock'
+                    const isLimited = store.stockStatus === 'LIMITED' || store.availability === 'Limited Stock'
+                    return (
+                      <tr
+                        key={store.storeId || store.store || i}
+                        className={`${i === 0 && !isOut ? "bg-emerald-50/50" : isOut ? "bg-slate-50/50 opacity-80" : ""} hover:bg-slate-50 transition-colors`}
+                      >
+                        <td className="py-3 pr-4">
+                          <div className="flex items-center gap-2">
+                            <span className="w-8 h-8 rounded-lg bg-indigo-50 text-indigo-700 font-bold flex items-center justify-center text-xs">
+                              {store.store.charAt(0)}
+                            </span>
+                            <div>
+                              <p className={`font-semibold ${isOut ? "text-slate-500 line-through" : "text-slate-800"}`}>{store.store}</p>
+                              {i === 0 && !isOut && (
+                                <span className="text-[10px] bg-emerald-100 text-emerald-700 px-1.5 py-0.5 rounded-full font-medium">Best Price</span>
+                              )}
+                              {isOut && (
+                                <span className="text-[10px] text-red-600 font-medium">Currently Unavailable</span>
+                              )}
+                            </div>
                           </div>
-                        </div>
-                      </td>
-                      <td className="py-3 pr-4">
-                        <span className={`text-base font-bold ${i === 0 ? "text-emerald-700" : "text-slate-800"}`}>
-                          {fmt(store.price)}
-                        </span>
-                      </td>
-                      <td className="py-3 pr-4 hidden sm:table-cell">
-                        <span className="text-slate-600">{store.shipping || "Free"}</span>
-                      </td>
-                      <td className="py-3 pr-4 hidden md:table-cell">
-                        <Badge variant={store.availability === "In Stock" ? "success" : "warning"}>
-                          {store.availability || "In Stock"}
-                        </Badge>
-                      </td>
-                      <td className="py-3 pr-4 hidden lg:table-cell">
-                        {store.diff > 0 ? (
-                          <span className="text-red-500 text-xs font-mono">+{fmt(store.diff)}</span>
-                        ) : (
-                          <span className="text-emerald-600 text-xs font-mono font-bold">Best</span>
-                        )}
-                      </td>
-                      <td className="py-3 text-right">
-                        <a
-                          href={getDirectBuyUrl(store)}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="bg-indigo-600 text-white text-xs font-medium px-3.5 py-1.5 rounded-lg hover:bg-indigo-700 transition-colors inline-flex items-center gap-1 shadow-sm"
-                        >
-                          Buy <ExternalLink size={12} />
-                        </a>
-                      </td>
-                    </tr>
-                  ))
+                        </td>
+                        <td className="py-3 pr-4">
+                          <span className={`text-base font-bold ${isOut ? "text-slate-400 line-through" : i === 0 ? "text-emerald-700" : "text-slate-800"}`}>
+                            {fmt(store.price)}
+                          </span>
+                        </td>
+                        <td className="py-3 pr-4 hidden sm:table-cell">
+                          <span className="text-slate-600">{isOut ? "—" : (store.shipping || "Free")}</span>
+                        </td>
+                        <td className="py-3 pr-4 hidden md:table-cell">
+                          <Badge variant={isOut ? "error" : isLimited ? "warning" : "success"}>
+                            {isOut ? "🔴 Out of Stock" : isLimited ? "🟡 Limited Stock" : "🟢 In Stock"}
+                          </Badge>
+                        </td>
+                        <td className="py-3 pr-4 hidden lg:table-cell">
+                          {isOut ? (
+                            <span className="text-slate-400 text-xs">Unavailable</span>
+                          ) : store.diff > 0 ? (
+                            <span className="text-red-500 text-xs font-mono">+{fmt(store.diff)}</span>
+                          ) : (
+                            <span className="text-emerald-600 text-xs font-mono font-bold">Best</span>
+                          )}
+                        </td>
+                        <td className="py-3 text-right">
+                          {isOut ? (
+                            <a
+                              href={getDirectBuyUrl(store)}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="bg-slate-100 text-slate-600 hover:bg-slate-200 text-xs font-medium px-3.5 py-1.5 rounded-lg border border-slate-300 transition-colors inline-flex items-center gap-1"
+                              title="Product is currently out of stock — click to check retailer or waitlist"
+                            >
+                              Check Store <ExternalLink size={12} />
+                            </a>
+                          ) : (
+                            <a
+                              href={getDirectBuyUrl(store)}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="bg-indigo-600 text-white text-xs font-medium px-3.5 py-1.5 rounded-lg hover:bg-indigo-700 transition-colors inline-flex items-center gap-1 shadow-sm"
+                            >
+                              Buy <ExternalLink size={12} />
+                            </a>
+                          )}
+                        </td>
+                      </tr>
+                    )
+                  })
                 ) : (
                   <tr>
                     <td className="py-3 pr-4 font-semibold text-slate-800">{product.bestStore}</td>
                     <td className="py-3 pr-4 font-bold text-emerald-700">{fmt(product.bestPrice)}</td>
                     <td className="py-3 pr-4 text-slate-600">Free</td>
-                    <td className="py-3 pr-4"><Badge variant="success">In Stock</Badge></td>
+                    <td className="py-3 pr-4"><Badge variant="success">🟢 In Stock</Badge></td>
                     <td className="py-3 pr-4 font-bold text-emerald-600">Best</td>
                     <td className="py-3 text-right">
                       <a
@@ -807,21 +1071,33 @@ export default function ProductDetail() {
         </div>
 
         {/* AI Analysis Insights */}
-        {insights.length > 0 && (
+        {effectiveInsights.length > 0 && (
           <div className="bg-white rounded-2xl border border-slate-200 p-6 mb-6 shadow-sm">
-            <div className="flex items-center gap-2 mb-4">
-              <div className="w-7 h-7 bg-gradient-to-br from-indigo-500 to-blue-500 rounded-lg flex items-center justify-center">
-                <Sparkles size={13} className="text-white" />
+            <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
+              <div className="flex items-center gap-2">
+                <div className="w-7 h-7 bg-gradient-to-br from-indigo-500 to-blue-500 rounded-lg flex items-center justify-center">
+                  <Sparkles size={13} className="text-white" />
+                </div>
+                <h2 className="text-lg font-bold text-slate-900">AI Intelligence Insights</h2>
               </div>
-              <h2 className="text-lg font-bold text-slate-900">AI Intelligence Insights</h2>
+              <span className="text-xs text-slate-500 font-medium flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                Live Dynamic Model Insights ({effectiveInsights.length} active)
+              </span>
             </div>
             <div className="grid md:grid-cols-2 gap-3">
-              {insights.map((item, idx) => (
+              {effectiveInsights.map((item, idx) => (
                 <div key={idx} className="flex items-start gap-2.5 p-3 rounded-xl bg-slate-50 border border-slate-100">
-                  <CheckCircle size={15} className="text-indigo-600 shrink-0 mt-0.5" />
+                  {item.type === 'warn' ? (
+                    <AlertTriangle size={15} className="text-amber-500 shrink-0 mt-0.5" />
+                  ) : item.type === 'info' ? (
+                    <TrendingUp size={15} className="text-blue-500 shrink-0 mt-0.5" />
+                  ) : (
+                    <CheckCircle size={15} className="text-emerald-600 shrink-0 mt-0.5" />
+                  )}
                   <div>
                     {item.label && <p className="text-xs font-semibold text-slate-500">{item.label}</p>}
-                    <p className="text-sm font-medium text-slate-800">{item.value || item.text}</p>
+                    <p className="text-sm font-medium text-slate-800 leading-snug">{item.text}</p>
                   </div>
                 </div>
               ))}
