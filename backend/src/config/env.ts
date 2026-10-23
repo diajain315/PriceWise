@@ -14,9 +14,9 @@ const num = (key: string, fallback: number): number => {
   return value;
 };
 
-const jwtSecret = str('JWT_SECRET');
-if (!jwtSecret) {
-  throw new Error('JWT_SECRET is not set. Copy backend/.env.example to backend/.env and set a random value.');
+const jwtSecret = str('JWT_SECRET', 'pricewise-dev-secret-key-32chars-min-length-12345');
+if (!process.env.JWT_SECRET) {
+  console.warn('[Config] Warning: JWT_SECRET not set in environment. Using default fallback.');
 }
 
 export const env = {
@@ -30,8 +30,9 @@ export const env = {
   jwtSecret,
   jwtExpiresIn: str('JWT_EXPIRES_IN', '1d'),
   adminApiKey: str('ADMIN_API_KEY'),
+  redisUrl: str('REDIS_URL', ''),
 
-  mlServiceUrl: str('ML_SERVICE_URL').replace(/\/+$/, ''),
+  mlServiceUrl: str('ML_SERVICE_URL', 'http://127.0.0.1:8000').replace(/\/+$/, ''),
 
   priceSyncIntervalMinutes: num('PRICE_SYNC_INTERVAL_MINUTES', 0),
   priceDropThresholdPercent: num('PRICE_DROP_THRESHOLD_PERCENT', 5),

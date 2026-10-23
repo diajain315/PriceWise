@@ -1,16 +1,115 @@
+# ==========================================
+# Dependencies & Package Managers
+# ==========================================
+node_modules/
+**/node_modules/
+.pnp
+.pnp.js
 
-/frontend/node_modules
-/UI- Figma
-/backend/node_modules
+# ==========================================
+# Environment Variables & Secrets (CRITICAL)
+# ==========================================
 .env
-*.env
 .env.*
+*.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
 *.pem
+*.key
+*.cert
+*.crt
 certs/
-node_modules
-dist
+
+# ==========================================
+# Build Outputs & Bundler Caches
+# ==========================================
+dist/
+**/dist/
+build/
+**/build/
+dist-ssr/
+out/
+.next/
+.turbo/
+.parcel-cache/
+.vercel/
+.output/
+
+# Vite temporary config bundles
+*.timestamp-*.mjs
+**/*.timestamp-*.mjs
+*.timestamp-*.js
+**/*.timestamp-*.js
+
+# ==========================================
+# Python & Virtual Environments
+# ==========================================
 __pycache__/
-*.pyc
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.venv
+.venv/
+**/.venv/
+venv/
+**/venv/
+env/
+**/env/
+ENV/
+*.egg-info/
+**/*.egg-info/
+.eggs/
+*.egg
+.pytest_cache/
+**/.pytest_cache/
+.mypy_cache/
+**/.mypy_cache/
+.ruff_cache/
+**/.ruff_cache/
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+# ==========================================
+# Databases & Local Storage
+# ==========================================
 *.db
 *.db-journal
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+
+# ==========================================
+# Logs & Diagnostics
+# ==========================================
+logs/
 *.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ==========================================
+# IDE & Operating System Artifacts
+# ==========================================
+.DS_Store
+Thumbs.db
+.idea/
+**/.idea/
+.vscode/*
+!.vscode/extensions.json
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*~
+
+# ==========================================
+# Project Specific Exclusions
+# ==========================================
+/UI- Figma
