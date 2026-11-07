@@ -88,14 +88,18 @@ export const evaluatePriceChange = async (
 
   for (const alert of alerts) {
     if (newBest <= alert.targetPrice) {
-      // Prevent duplicate notifications if already triggered for this price level
-      if (alert.triggeredAt) {
-        alreadyNotified.add(alert.userId);
+      // If previous price is known and price did not actually drop (e.g. price was unchanged or increased),
+      // suppress triggering the alert
+      if (previousBest !== null && !isGenuinePriceReduction) {
+        console.info(
+          `[AlertEngine] Target reached for alert ${alert.id}, but no prior price drop observed (prev: ${previousBest}, new: ${newBest}). Suppressing price-drop email.`,
+        );
         continue;
       }
 
-      // Suppress alert triggering when no genuine price reduction occurred
-      if (!isGenuinePriceReduction) {
+      // Prevent duplicate notifications if already triggered for this price level
+      if (alert.triggeredAt) {
+        alreadyNotified.add(alert.userId);
         continue;
       }
 
@@ -119,9 +123,9 @@ export const evaluatePriceChange = async (
         created++;
       }
 
-      // Send email alert only if a genuine price reduction occurred and user enabled target email
+      // Send email alert only if genuine price reduction occurred or first observation, and user enabled target email
       if (alert.notifyEmail && alert.user?.email && prefs.targetEmail) {
-        if (isGenuinePriceReduction) {
+        if (isGenuinePriceReduction || previousBest === null) {
           sendPriceDropAlertEmail({
             email: alert.user.email,
             userName: alert.user.name || undefined,
@@ -130,15 +134,11 @@ export const evaluatePriceChange = async (
             previousPrice: previousBest,
             currentPrice: newBest,
             targetPrice: alert.targetPrice,
-            dropAmount: previousBest - newBest,
+            dropAmount: isGenuinePriceReduction && previousBest !== null ? previousBest - newBest : 0,
             bestStore: bestStoreName,
             productUrl: directProductUrl,
             imageUrl: product.imageUrl || undefined,
           }).catch((err) => console.error('[AlertEngine Email Error]:', err));
-        } else {
-          console.info(
-            `[AlertEngine] Target reached for alert ${alert.id}, but no prior price drop observed (prev: ${previousBest}, new: ${newBest}). Suppressing price-drop email.`,
-          );
         }
       }
 
