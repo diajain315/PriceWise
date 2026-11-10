@@ -7,6 +7,7 @@ import type {
   MarketIntelligenceSummary,
   AIChatResponse,
   StorePriceRow,
+  ProductLiveOffersResponse,
   PricePoint,
   PredictionPoint,
   ProductPredictionResult,
@@ -157,6 +158,14 @@ export const api = {
     return res.data;
   },
 
+  async getLiveOffers(id: string, refresh = false): Promise<ProductLiveOffersResponse> {
+    const res = await apiClient.get<ProductLiveOffersResponse>(
+      `/products/${encodeURIComponent(id)}/live-offers`,
+      { params: refresh ? { refresh: 'true' } : undefined }
+    );
+    return res.data;
+  },
+
   async getProductHistory(id: string, range?: string, store?: string): Promise<PricePoint[]> {
     const res = await apiClient.get<any>(`/products/${encodeURIComponent(id)}/history`, {
       params: { range, store },
@@ -285,6 +294,7 @@ export const api = {
     targetPrice: number;
     email: string;
     userName?: string;
+    notifyStock?: boolean;
   }): Promise<{ success: boolean; message: string; alertId?: string }> {
     const res = await apiClient.post('/user/alerts/notify', data);
     return res.data;
@@ -294,8 +304,26 @@ export const api = {
     productId: string;
     email: string;
     userName?: string;
+    notifyStock?: boolean;
   }): Promise<{ success: boolean; message: string }> {
     const res = await apiClient.post('/user/alerts/test-email', data);
+    return res.data;
+  },
+
+  async setStockAlert(data: {
+    productId: string;
+    notifyStock?: boolean;
+  }): Promise<{ success: boolean; message: string; alertId?: string; notifyStock: boolean; currentStockStatus: string }> {
+    const res = await apiClient.post('/user/alerts/stock', data);
+    return res.data;
+  },
+
+  async testStockAlert(data: {
+    productId: string;
+    email: string;
+    userName?: string;
+  }): Promise<{ success: boolean; message: string }> {
+    const res = await apiClient.post('/user/alerts/test-stock-email', data);
     return res.data;
   },
 
@@ -352,6 +380,72 @@ export const api = {
     const res = await apiClient.get<{ personalised: boolean; items: Product[] }>('/user/recommendations', {
       params: { limit },
     });
+    return res.data;
+  },
+
+  // ---------------------------------------------------------------- Admin
+  async getAdminReports(): Promise<any> {
+    const res = await apiClient.get('/admin/reports');
+    return res.data;
+  },
+
+  async getAdminProducts(params?: { page?: number; limit?: number; q?: string; brand?: string; stock?: string }): Promise<any> {
+    const res = await apiClient.get('/admin/products', { params });
+    return res.data;
+  },
+
+  async getAdminProduct(id: string): Promise<any> {
+    const res = await apiClient.get(`/admin/products/${encodeURIComponent(id)}`);
+    return res.data;
+  },
+
+  async createAdminProduct(data: any): Promise<any> {
+    const res = await apiClient.post('/admin/products', data);
+    return res.data;
+  },
+
+  async updateAdminProduct(id: string, data: any): Promise<any> {
+    const res = await apiClient.patch(`/admin/products/${encodeURIComponent(id)}`, data);
+    return res.data;
+  },
+
+  async deleteAdminProduct(id: string): Promise<any> {
+    const res = await apiClient.delete(`/admin/products/${encodeURIComponent(id)}`);
+    return res.data;
+  },
+
+  async getAdminUsers(params?: { page?: number; limit?: number; q?: string; role?: string }): Promise<any> {
+    const res = await apiClient.get('/admin/users', { params });
+    return res.data;
+  },
+
+  async updateAdminUserRole(id: string, role: 'USER' | 'ADMIN'): Promise<any> {
+    const res = await apiClient.patch(`/admin/users/${encodeURIComponent(id)}/role`, { role });
+    return res.data;
+  },
+
+  async toggleAdminUserBan(id: string): Promise<any> {
+    const res = await apiClient.patch(`/admin/users/${encodeURIComponent(id)}/ban`);
+    return res.data;
+  },
+
+  async deleteAdminUser(id: string): Promise<any> {
+    const res = await apiClient.delete(`/admin/users/${encodeURIComponent(id)}`);
+    return res.data;
+  },
+
+  async getAdminNotificationQueue(params?: { page?: number; limit?: number; status?: string }): Promise<any> {
+    const res = await apiClient.get('/admin/notifications/queue', { params });
+    return res.data;
+  },
+
+  async retryAdminNotificationJob(id: string): Promise<any> {
+    const res = await apiClient.post(`/admin/notifications/queue/${encodeURIComponent(id)}/retry`);
+    return res.data;
+  },
+
+  async triggerAdminMonitorCycle(): Promise<any> {
+    const res = await apiClient.post('/admin/monitor/trigger');
     return res.data;
   },
 };
