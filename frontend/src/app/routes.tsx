@@ -1,4 +1,5 @@
-import { createBrowserRouter, Outlet } from "react-router"
+import { useEffect } from "react"
+import { createBrowserRouter, Outlet, useLocation } from "react-router"
 import Navbar from "../components/layout/Navbar"
 import Home from "../pages/Home"
 import Discover from "../pages/Discover"
@@ -14,13 +15,23 @@ import Alerts from "../pages/Alerts"
 import Profile from "../pages/Profile"
 import Settings from "../pages/Settings"
 import Login from "../pages/Login"
+import Admin from "../pages/Admin"
 
 import FloatingAssistantButton from "../components/ui/FloatingAssistantButton"
 import Footer from "../components/layout/Footer"
 
+function ScrollToTop() {
+  const { pathname } = useLocation()
+  useEffect(() => {
+    window.scrollTo({ top: 0, left: 0, behavior: "instant" })
+  }, [pathname])
+  return null
+}
+
 function Root() {
   return (
     <div className="min-h-screen flex flex-col bg-[#f4f6fb]">
+      <ScrollToTop />
       <Navbar />
       <main className="flex-1 pb-16 lg:pb-0">
         <Outlet />
@@ -55,6 +66,7 @@ export const router = createBrowserRouter([
       { path: "alerts", Component: Alerts },
       { path: "profile", Component: Profile },
       { path: "settings", Component: Settings },
+      { path: "admin", Component: Admin },
     ],
   },
   {
@@ -62,6 +74,7 @@ export const router = createBrowserRouter([
     children: [
       { path: "login", Component: Login },
       { path: "signup", Component: Login },
+      { path: "auth/callback", Component: Login },
     ],
   },
 ])
