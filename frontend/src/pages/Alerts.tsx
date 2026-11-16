@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react"
-import { Bell, TrendingDown, Trash2, Loader2, LogIn } from "lucide-react"
+import { Bell, TrendingDown, Trash2, Loader2, LogIn, CheckCircle2, ChevronLeft, ChevronRight } from "lucide-react"
 import { Link, useNavigate } from "react-router"
 import Badge from "../components/ui/Badge"
 import { api } from "../services/api"
@@ -26,6 +26,13 @@ export default function Alerts() {
   })
   const [loading, setLoading] = useState(true)
   const [actionLoadingId, setActionLoadingId] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+
+  // Pagination states
+  const [alertsPage, setAlertsPage] = useState(1)
+  const ALERTS_PER_PAGE = 8
+  const [eventsPage, setEventsPage] = useState(1)
+  const EVENTS_PER_PAGE = 8
 
   const loadAlerts = useCallback(async () => {
     if (!isAuthenticated) {
@@ -82,7 +89,7 @@ export default function Alerts() {
       }))
     } catch (err: any) {
       console.error("Failed to update alert state:", err)
-      alert("Failed to update alert: " + (err.response?.data?.message || err.message))
+      setActionError("Failed to update alert: " + (err.response?.data?.message || err.message))
     } finally {
       setActionLoadingId(null)
     }
@@ -99,7 +106,7 @@ export default function Alerts() {
       }))
     } catch (err: any) {
       console.error("Failed to delete alert:", err)
-      alert("Failed to delete alert: " + (err.response?.data?.message || err.message))
+      setActionError("Failed to delete alert: " + (err.response?.data?.message || err.message))
     } finally {
       setActionLoadingId(null)
     }
@@ -145,6 +152,12 @@ export default function Alerts() {
     )
   }
 
+  const totalAlertPages = Math.max(1, Math.ceil(alerts.length / ALERTS_PER_PAGE))
+  const paginatedAlerts = alerts.slice((alertsPage - 1) * ALERTS_PER_PAGE, alertsPage * ALERTS_PER_PAGE)
+
+  const totalEventPages = Math.max(1, Math.ceil(events.length / EVENTS_PER_PAGE))
+  const paginatedEvents = events.slice((eventsPage - 1) * EVENTS_PER_PAGE, eventsPage * EVENTS_PER_PAGE)
+
   return (
     <div className="min-h-screen bg-[#f4f6fb] pt-14">
       <div className="max-w-[1440px] mx-auto px-6 py-6">
@@ -155,6 +168,13 @@ export default function Alerts() {
             <p className="text-sm text-slate-500">Track when your tracked smartphones hit your target price</p>
           </div>
         </div>
+
+        {actionError && (
+          <div className="mb-4 p-3 bg-red-50 border border-red-200 text-red-700 rounded-xl text-sm flex items-center justify-between">
+            <span>{actionError}</span>
+            <button type="button" onClick={() => setActionError(null)} className="text-red-500 hover:text-red-700 font-semibold ml-2">✕</button>
+          </div>
+        )}
 
         {/* Summary cards */}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
@@ -207,7 +227,7 @@ export default function Alerts() {
                 </h2>
 
                 <div className="space-y-3">
-                  {alerts.map((alert) => (
+                  {paginatedAlerts.map((alert) => (
                     <div
                       key={alert.id}
                       className={`bg-white rounded-xl border p-4 flex flex-col sm:flex-row gap-4 items-start sm:items-center justify-between shadow-2xs transition-all ${
@@ -231,6 +251,11 @@ export default function Alerts() {
                             {alert.product?.name}
                           </h3>
                           <div className="flex items-center gap-2 mt-1">
+                            {alert.notifyStock && (
+                              <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-sky-50 text-sky-700 border border-sky-200">
+                                Restock Alert Active
+                              </span>
+                            )}
                             <span className="text-xs text-slate-500">Target:</span>
                             <span className="text-sm font-bold text-indigo-600 font-mono">
                               {fmt(alert.targetPrice)}
@@ -272,6 +297,33 @@ export default function Alerts() {
                     </div>
                   ))}
                 </div>
+
+                {totalAlertPages > 1 && (
+                  <div className="flex flex-col sm:flex-row items-center justify-between gap-2 pt-3 px-1 text-xs text-slate-500">
+                    <span>
+                      Showing <span className="font-bold text-slate-800">{(alertsPage - 1) * ALERTS_PER_PAGE + 1}</span>–<span className="font-bold text-slate-800">{Math.min(alertsPage * ALERTS_PER_PAGE, alerts.length)}</span> of <span className="font-bold text-slate-800">{alerts.length}</span> alerts
+                    </span>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        onClick={() => setAlertsPage((p) => Math.max(1, p - 1))}
+                        disabled={alertsPage <= 1}
+                        className="flex items-center gap-1 px-2.5 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed font-semibold text-slate-700 cursor-pointer"
+                      >
+                        <ChevronLeft size={13} /> Prev
+                      </button>
+                      <span className="px-2 font-bold text-slate-700">
+                        Page {alertsPage} / {totalAlertPages}
+                      </span>
+                      <button
+                        onClick={() => setAlertsPage((p) => Math.min(totalAlertPages, p + 1))}
+                        disabled={alertsPage >= totalAlertPages}
+                        className="flex items-center gap-1 px-2.5 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed font-semibold text-slate-700 cursor-pointer"
+                      >
+                        Next <ChevronRight size={13} />
+                      </button>
+                    </div>
+                  </div>
+                )}
               </section>
             )}
 
@@ -286,13 +338,13 @@ export default function Alerts() {
                 </h2>
 
                 <div className="space-y-3">
-                  {events.map((e) => (
+                  {paginatedEvents.map((e) => (
                     <div
                       key={e.id}
                       className="bg-white rounded-xl border border-emerald-100 p-4 flex gap-4 shadow-2xs items-center"
                     >
-                      <div className="w-10 h-10 bg-emerald-50 rounded-xl flex items-center justify-center shrink-0">
-                        <TrendingDown size={18} className="text-emerald-600" />
+                      <div className={`w-10 h-10 ${e.status === 'stock' ? 'bg-sky-50 text-sky-600' : 'bg-emerald-50 text-emerald-600'} rounded-xl flex items-center justify-center shrink-0`}>
+                        {e.status === 'stock' ? <CheckCircle2 size={18} /> : <TrendingDown size={18} />}
                       </div>
                       <div className="flex-1 min-w-0">
                         <p className="text-sm font-semibold text-slate-800 line-clamp-1">{e.product?.name}</p>
@@ -303,12 +355,16 @@ export default function Alerts() {
                             </span>
                           )}
                           <span className="text-sm font-bold text-emerald-700 font-mono">{fmt(e.newPrice)}</span>
-                          {e.dropPercent && (
+                          {e.status === 'stock' ? (
+                            <Badge variant="info">
+                              Back in Stock
+                            </Badge>
+                          ) : e.dropPercent ? (
                             <Badge variant="success">
                               <TrendingDown size={10} />
                               {e.dropPercent}% drop
                             </Badge>
-                          )}
+                          ) : null}
                           {e.target && (
                             <span className="text-xs text-indigo-600 font-medium">Target: {fmt(e.target)}</span>
                           )}
@@ -320,6 +376,33 @@ export default function Alerts() {
                     </div>
                   ))}
                 </div>
+
+                {totalEventPages > 1 && (
+                  <div className="flex flex-col sm:flex-row items-center justify-between gap-2 pt-3 px-1 text-xs text-slate-500">
+                    <span>
+                      Showing <span className="font-bold text-slate-800">{(eventsPage - 1) * EVENTS_PER_PAGE + 1}</span>–<span className="font-bold text-slate-800">{Math.min(eventsPage * EVENTS_PER_PAGE, events.length)}</span> of <span className="font-bold text-slate-800">{events.length}</span> events
+                    </span>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        onClick={() => setEventsPage((p) => Math.max(1, p - 1))}
+                        disabled={eventsPage <= 1}
+                        className="flex items-center gap-1 px-2.5 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed font-semibold text-slate-700 cursor-pointer"
+                      >
+                        <ChevronLeft size={13} /> Prev
+                      </button>
+                      <span className="px-2 font-bold text-slate-700">
+                        Page {eventsPage} / {totalEventPages}
+                      </span>
+                      <button
+                        onClick={() => setEventsPage((p) => Math.min(totalEventPages, p + 1))}
+                        disabled={eventsPage >= totalEventPages}
+                        className="flex items-center gap-1 px-2.5 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed font-semibold text-slate-700 cursor-pointer"
+                      >
+                        Next <ChevronRight size={13} />
+                      </button>
+                    </div>
+                  </div>
+                )}
               </section>
             )}
           </div>
