@@ -1,31 +1,14 @@
-# Dependencies
-node_modules/
-
-# Environment Variables & Secrets
+node_modules
+# Keep environment variables out of version control
 .env
 .env.*
 *.env
 *.pem
-*.key
-*.cert
-*.crt
 certs/
-
-# Build Output & Generated Files
-dist/
-src/generated/prisma/
-
-# Databases & Logs
 *.db
 *.db-journal
-*.sqlite
-*.sqlite3
-*.log
-logs/
 
-# Editor & OS files
-.DS_Store
-Thumbs.db
-.idea/
-.vscode/*
-!.vscode/extensions.json
+/src/generated/prisma
+/dist
+
+
