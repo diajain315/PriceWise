@@ -1,4 +1,5 @@
 import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
 import prisma from '../utils/prisma';
 import { env } from '../config/env';
 import { HttpError } from '../utils/http';
@@ -104,30 +105,98 @@ export async function exchangeGoogleCode(code: string, redirectUri: string): Pro
 }
 
 /**
+ * Verifies or decodes a Supabase JWT token and extracts user info
+ */
+export async function verifySupabaseToken(token: string): Promise<GoogleUserInfo | null> {
+  // 1. If Supabase URL is available, verify cryptographically via Supabase auth API
+  if (env.supabase.url) {
+    try {
+      const res = await fetch(`${env.supabase.url.replace(/\/+$/, '')}/auth/v1/user`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          apikey: env.supabase.anonKey,
+        },
+      });
+      if (res.ok) {
+        const data: any = await res.json();
+        if (data?.email) {
+          return {
+            email: data.email.toLowerCase(),
+            name: data.user_metadata?.full_name || data.user_metadata?.name || data.email.split('@')[0],
+            picture: data.user_metadata?.avatar_url || data.user_metadata?.picture,
+            googleId: data.user_metadata?.provider_id || data.id,
+          };
+        }
+      }
+    } catch {
+      // Ignore network error and attempt fallback decode
+    }
+  }
+
+  // 2. Fallback: inspect token payload if it was issued by Supabase
+  try {
+    const decoded: any = jwt.decode(token);
+    if (decoded && (decoded.iss?.includes('supabase.co') || decoded.app_metadata?.provider === 'google') && decoded.email) {
+      return {
+        email: decoded.email.toLowerCase(),
+        name: decoded.user_metadata?.full_name || decoded.user_metadata?.name || decoded.email.split('@')[0],
+        picture: decoded.user_metadata?.avatar_url || decoded.user_metadata?.picture,
+        googleId: decoded.user_metadata?.provider_id || decoded.sub,
+      };
+    }
+  } catch {
+    // Not a valid JWT
+  }
+
+  return null;
+}
+
+/**
  * Authenticates or auto-provisions a user account via Google OAuth
  */
 export async function authenticateWithGoogle(payload: GoogleAuthPayload) {
-  let googleUser: GoogleUserInfo;
+  let googleUser: GoogleUserInfo | null = null;
 
   if (payload.credential) {
-    googleUser = await verifyGoogleIdToken(payload.credential);
+    try {
+      googleUser = await verifyGoogleIdToken(payload.credential);
+    } catch (err) {
+      // If credential fails with Google tokeninfo, check if client sent a Supabase token
+      const sbUser = await verifySupabaseToken(payload.credential);
+      if (sbUser) {
+        googleUser = sbUser;
+      } else {
+        throw err;
+      }
+    }
   } else if (payload.code) {
     const redirectUri = payload.redirectUri || 'http://localhost:5173/auth/callback';
     googleUser = await exchangeGoogleCode(payload.code, redirectUri);
   } else if (payload.accessToken) {
-    const res = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-      headers: { Authorization: `Bearer ${payload.accessToken}` },
-    });
-    if (!res.ok) throw new HttpError(401, 'Invalid Google access token.');
-    const data: any = await res.json();
-    googleUser = {
-      email: data.email.toLowerCase(),
-      name: data.name || data.email.split('@')[0],
-      picture: data.picture,
-      googleId: data.sub,
-    };
+    // First, check if the accessToken is a Supabase token
+    const sbUser = await verifySupabaseToken(payload.accessToken);
+    if (sbUser) {
+      googleUser = sbUser;
+    } else {
+      // Otherwise, query Google's userinfo endpoint
+      const res = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+        headers: { Authorization: `Bearer ${payload.accessToken}` },
+      });
+      if (!res.ok) throw new HttpError(401, 'Invalid Google access token.');
+      const data: any = await res.json();
+      googleUser = {
+        email: data.email.toLowerCase(),
+        name: data.name || data.email.split('@')[0],
+        picture: data.picture,
+        googleId: data.sub,
+      };
+    }
   } else {
     throw new HttpError(400, 'Missing Google credential or authorization code.');
+  }
+
+  if (!googleUser || !googleUser.email) {
+    throw new HttpError(401, 'Failed to extract user profile from authentication token.');
   }
 
   // Find or create user in database

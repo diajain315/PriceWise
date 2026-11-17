@@ -68,7 +68,35 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const refreshUser = useCallback(async () => {
     let token = localStorage.getItem('token') || localStorage.getItem('auth_token');
 
-    // Check if returning from Supabase OAuth redirect flow
+    // 1. Check if URL hash contains OAuth tokens from Supabase redirect (#access_token=... or #provider_token=...)
+    if (!token && typeof window !== 'undefined' && window.location.hash) {
+      try {
+        const hash = window.location.hash.substring(1);
+        const params = new URLSearchParams(hash);
+        const hashAccessToken = params.get('access_token');
+        const hashProviderToken = params.get('provider_token');
+
+        if (hashAccessToken || hashProviderToken) {
+          const res = await api.googleAuth({
+            accessToken: hashProviderToken || hashAccessToken || undefined,
+            credential: hashAccessToken || undefined,
+          });
+          if (res?.token) {
+            token = res.token;
+            setUser(res.user);
+            await refreshSavedState();
+            // Clean up hash from browser URL bar
+            window.history.replaceState(null, '', window.location.pathname + window.location.search);
+            setLoading(false);
+            return;
+          }
+        }
+      } catch (err) {
+        console.warn('Failed to exchange hash token with backend:', err);
+      }
+    }
+
+    // 2. Check if returning from Supabase session
     if (!token && supabase) {
       try {
         const { data } = await supabase.auth.getSession();
@@ -83,6 +111,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             token = res.token;
             setUser(res.user);
             await refreshSavedState();
+            window.history.replaceState(null, '', window.location.pathname + window.location.search);
             setLoading(false);
             return;
           }
@@ -118,7 +147,36 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   useEffect(() => {
     refreshUser();
-  }, [refreshUser]);
+
+    if (supabase) {
+      const { data: authListener } = supabase.auth.onAuthStateChange(async (event, session) => {
+        if (session && (event === 'SIGNED_IN' || event === 'INITIAL_SESSION')) {
+          const existingToken = localStorage.getItem('token') || localStorage.getItem('auth_token');
+          if (!existingToken) {
+            try {
+              const providerToken = session.provider_token;
+              const accessToken = session.access_token;
+              const res = await api.googleAuth({
+                accessToken: providerToken || accessToken,
+                credential: (session as any).provider_id_token || undefined,
+              });
+              if (res?.token) {
+                setUser(res.user);
+                await refreshSavedState();
+                window.history.replaceState(null, '', window.location.pathname + window.location.search);
+              }
+            } catch (err) {
+              console.warn('Supabase auth state change exchange failed:', err);
+            }
+          }
+        }
+      });
+
+      return () => {
+        authListener.subscription.unsubscribe();
+      };
+    }
+  }, [refreshUser, refreshSavedState]);
 
   const login = async (credentials: { email: string; password: string }) => {
     const res = await api.login(credentials);

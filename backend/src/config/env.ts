@@ -77,6 +77,11 @@ export const env = {
     clientSecret: str('GOOGLE_CLIENT_SECRET') || str('Client_secret', ''),
   },
 
+  supabase: {
+    url: str('SUPABASE_URL', ''),
+    anonKey: str('SUPABASE_ANON_KEY', ''),
+  },
+
   gemini: {
     apiKey: str('GEMINI_API_KEY'),
     model: str('GEMINI_MODEL', 'gemini-3.1-flash-lite'),
