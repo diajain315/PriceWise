@@ -2,7 +2,7 @@ import { useState, useEffect } from "react"
 import { Link, useNavigate, useLocation } from "react-router"
 import { Eye, EyeOff, Sparkles, BarChart2, Bell, TrendingDown, Loader2, KeyRound, ArrowLeft, RefreshCw, CheckCircle2 } from "lucide-react"
 import { useAuth } from "../context/AuthContext"
-import { signInWithGoogle } from "../services/supabase"
+import { signInWithGoogle, isSupabaseConfigured } from "../services/supabase"
 import { triggerGoogleSignIn } from "../services/googleAuth"
 
 export default function Login() {
@@ -158,25 +158,23 @@ export default function Login() {
       setAuthError(null)
       setAuthSuccess(null)
 
-      // 1. First attempt direct Google Identity Services popup
-      try {
-        const { accessToken, credential } = await triggerGoogleSignIn()
-        if (accessToken || credential) {
-          await loginWithGoogle({ accessToken, credential })
-          return
-        }
-      } catch (gisErr: any) {
-        const msg = String(gisErr?.message || "")
-        if (msg.includes("cancelled") || msg.includes("popup_closed_by_user")) {
-          setGoogleLoading(false)
-          return
-        }
-        console.warn("Direct Google sign-in fallback to Supabase:", msg)
+      // 1. If Supabase is configured, use standard Supabase Google OAuth redirect.
+      // This completely avoids Google Identity Services popup 'origin_mismatch' errors.
+      if (isSupabaseConfigured) {
+        await signInWithGoogle()
+        return
       }
 
-      // 2. Fallback to Supabase OAuth redirect if direct GIS not used
-      await signInWithGoogle()
+      // 2. Fallback to direct Google Identity Services popup if Supabase is not configured
+      const { accessToken, credential } = await triggerGoogleSignIn()
+      if (accessToken || credential) {
+        await loginWithGoogle({ accessToken, credential })
+      }
     } catch (err: any) {
+      const msg = String(err?.message || "")
+      if (msg.includes("cancelled") || msg.includes("popup_closed_by_user")) {
+        return
+      }
       console.error("Google sign in error:", err)
       setAuthError(err?.message || "Failed to sign in with Google")
     } finally {

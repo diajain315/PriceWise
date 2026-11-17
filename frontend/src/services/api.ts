@@ -28,7 +28,19 @@ const normalizeApiBase = (url?: string): string => {
   return trimmed.endsWith('/api') ? trimmed : `${trimmed}/api`;
 };
 
-const API_BASE = normalizeApiBase(import.meta.env.VITE_API_URL || (import.meta.env as any).API_URL);
+const getApiBaseUrl = (): string => {
+  const envUrl = import.meta.env.VITE_API_URL || (import.meta.env as any).API_URL;
+  if (typeof window !== 'undefined') {
+    const isLocalhost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+    // If running in production browser but envUrl points to localhost or is missing, use production backend
+    if (!isLocalhost && (!envUrl || envUrl.includes('localhost') || envUrl.includes('127.0.0.1'))) {
+      return 'https://pricewise-backend.vercel.app/api';
+    }
+  }
+  return normalizeApiBase(envUrl || 'http://localhost:5000/api');
+};
+
+const API_BASE = getApiBaseUrl();
 
 export const apiClient = axios.create({
   baseURL: API_BASE,
